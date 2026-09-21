@@ -12,7 +12,7 @@
 //! |---|---|---|---|
 //! | PowerShell(`*.ps1/.psm1/.psd1`) | **UTF-8 with BOM** | CRLF | 5.1은 BOM이 없으면 ANSI로 읽는다 |
 //! | `.bat`/`.cmd` | **ASCII만** | CRLF | `cmd.exe`는 OEM 코드페이지 — 한글은 `.ps1`로 |
-//! | 그 외 텍스트 | UTF-8 **without** BOM | (깃이 맞춘다) | rustc/cargo/깃은 항상 UTF-8 — BOM은 노이즈 |
+//! | 그 외 텍스트 | UTF-8 **without** BOM | **CRLF**(윈도우) | rustc/cargo/깃은 항상 UTF-8 — BOM은 노이즈 |
 //!
 //! `.editorconfig`가 에디터의 **저장**을, `.gitattributes`가 **줄바꿈**을 맡고, 여기서는
 //! 결과를 검사한다. 이 파일은 `cargo test -p light-note-core`에 포함되고 그 명령이
@@ -221,26 +221,27 @@ fn other_text_files_do_not_start_with_a_bom() {
 ///
 /// 리눅스 체크아웃은 LF일 수 있고(5.1도 LF는 읽는다) 그걸 실패로 만들면 안 된다.
 /// 윈도우 워크트리는 `.gitattributes`의 `eol=crlf`가 CRLF를 보장한다.
+///
+/// **모든 텍스트 파일**에 같은 규칙을 건다: `.editorconfig`(`end_of_line = crlf`)와
+/// `.gitattributes`가 그렇게 맞추기로 했고, 새로 만든 파일이 LF로 저장되는 드리프트를
+/// 여기서 잡는다(실제로 이 테스트가 그런 파일 두 개를 잡아냈다).
 #[cfg(windows)]
 #[test]
-fn powershell_files_use_crlf_on_windows() {
+fn text_files_use_crlf_on_windows() {
     let Some(root) = workspace_root() else {
         return;
     };
     for path in text_files(&root) {
-        if !is_powershell(&path) {
-            continue;
-        }
         let name = shown(&root, &path);
-        let text = std::fs::read_to_string(&path).expect("BOM 있는 UTF-8 .ps1");
-        let lone_lf = text
-            .match_indices('\n')
-            .filter(|(index, _)| *index == 0 || text.as_bytes()[index - 1] != b'\r')
+        let bytes = read(&path);
+        let bare_lf = bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, byte)| **byte == b'\n' && (*index == 0 || bytes[index - 1] != b'\r'))
             .count();
         assert_eq!(
-            lone_lf, 0,
-            "{name}: CR 없는 LF가 {lone_lf}개다 — 윈도우 도구는 CRLF를 기본으로 본다. \
-             `.gitattributes`의 `*.ps1 text eol=crlf`와 core.autocrlf를 확인하라"
+            bare_lf, 0,
+            "{name}: CR 없이 오는 LF가 {bare_lf}개 있다 — 윈도우 워크트리는 CRLF다(.editorconfig)"
         );
     }
 }

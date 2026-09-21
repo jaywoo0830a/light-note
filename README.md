@@ -35,13 +35,14 @@ crates/light-note-win    WinUI 3 호스트 — 윈도우 11 전용 (포인터/�
 cargo test -p light-note-core
 ```
 
-57개 테스트가 **UI 계약과 인코딩 규칙까지** 검증한다(윈도우에서도 그대로 돈다):
+63개 테스트가 **UI 계약과 인코딩 규칙까지** 검증한다(윈도우에서도 그대로 돈다):
 
 - `ink_model` — 샘플 필터/필압/경계/지우개 히트 테스트
 - `document` — Undo/Redo(지우개 드래그 = 편집 하나), 페이지 관리, 취소
 - `raster` — 잉크가 **어디에** 올라갔는지 픽셀로 확인, 결정성, PNG 왕복
 - `export` — 내보낸 PDF를 **hayro로 다시 읽어** 배경/잉크 위치까지 검증
 - `ui_plan` — 버튼 → 의도 매핑, 상태 분기(로딩/빈/준비/실패), `<Raw>` 표면 전달
+- `surface` — 정적 PNG/라이브 선분이 **언제** 바뀌는가(백그라운드 렌더의 꼬리 규칙)
 - `encoding` — `.ps1`의 **UTF-8 BOM**, 모든 텍스트 파일의 UTF-8/CRLF 계약
   (Windows PowerShell 5.1이 BOM 없는 `.ps1`을 ANSI로 읽어 파싱이 죽던 사고의 재발 방지)
 
@@ -114,10 +115,25 @@ cargo run   -p light-note-win --release
 ## Windows 11 최적화 포인트
 
 1. **확정 레이어 = PNG 한 장** — 드래그가 *끝날 때만* 다시 만든다(`InkSurface` 계약).
-2. **라이브 레이어 = WinUI `Line` 몇 개** — GPU 합성이라 포인터에 즉시 반응한다.
-3. **포인터는 `Border`** — `windows-reactor` 0.100에서 포인터 이벤트는 `Border`에만 있다.
+2. **그 PNG는 백그라운드에서 만든다** — A4 한 장이 13ms(release)/277ms(dev)이고 그 80%가
+   PNG 인코딩이다. 포인터 메시지 처리 안에서 돌리면 **획을 끝낼 때마다 화면이 멈춘다**.
+   그래서 UI 스레드는 워커에 맡기고, 도착 전까지 방금 확정한 획을 라이브 선분으로 그려
+   빈 틈을 메운다(`surface::pending_lines`). 낡은 렌더 결과는 **세대 번호**로 버리고,
+   렌더 중에 또 그으면 작업을 다음 한 번으로 합친다(한 번에 하나만 돈다).
+3. **라이브 레이어 = WinUI `Line` 몇 개** — GPU 합성이라 포인터에 즉시 반응한다.
+4. **포인터는 `Border`** — `windows-reactor` 0.100에서 포인터 이벤트는 `Border`에만 있다.
    `Canvas`는 절대 좌표 배치, `Image`는 정적 레이어 전용이다.
-4. **입력은 메시지 큐를 거쳐** 처리된다(Reactor의 이벤트 FIFO) — elm의 "이벤트 = 할당"과 맞는다.
+5. **입력은 메시지 큐를 거쳐** 처리된다(Reactor의 이벤트 FIFO) — elm의 "이벤트 = 할당"과 맞는다.
+
+비용은 **예제로 잰다** — 숫자를 바꾸기 전에 먼저 재라:
+
+```bash
+cargo run --release -p light-note-core --example surface_cost
+```
+
+정적 레이어(획 수별) / 그 안쪽(래스터·픽셀 스캔·PNG 인코딩) / 라이브 선분 / 뷰모델 생성
+시간을 한 번에 출력한다. **`-DebugBuild`(opt-level 0)는 20배 느리다** — 필기감을 볼 때는
+기본(릴리스)로 돌려라.
 
 ## 알아둘 한계 (어댑터/런타임 사실)
 

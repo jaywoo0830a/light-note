@@ -15,7 +15,10 @@
 //! ## 스레드 규칙
 //! - `HostMessage`는 `Send`다(`spawn_background` 요구 — 예제 11). 그래서 **PDF 문서를
 //!   메시지에 넣지 않는다**(`PdfDocument`는 스레드 경계를 넘기지 않는다).
-//! - 백그라운드: 파일 읽기/쓰기/내보내기. UI 스레드: 파싱(지연)과 렌더.
+//! - 백그라운드: 파일 읽기/쓰기/내보내기, **정적 레이어 래스터 + PNG 인코딩**.
+//!   UI 스레드: elm 프레임과 라이브 선분(선분 몇 개). 페이지 전체를 다시 그리는 일은
+//!   포인터 메시지 안에서 하지 않는다 — 실측 A4 한 장 = 13ms(release)/277ms(dev).
+//!   그 사이에 확정된 획은 라이브 선분으로 계속 그린다([`pending_lines`]).
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,10 +28,11 @@ use elm_magic_windows_reactor::{ElmInput, ElmView};
 use light_note_core::doc::Document;
 use light_note_core::export::{self, EXPORT_SCALE};
 use light_note_core::geom::{Point, Size};
-use light_note_core::ink::{pressure_from_speed, InkPoint, StrokeStyle, Tool};
+use light_note_core::history::Edit;
+use light_note_core::ink::{pressure_from_speed, InkPoint, Stroke, StrokeStyle, Tool};
 use light_note_core::pdf::PdfDocument;
 use light_note_core::raster::{page_pixel_size, ViewTransform};
-use light_note_core::surface::{live_lines, InkSurface};
+use light_note_core::surface::{has_ink, pending_lines, static_layer, InkSurface};
 use light_note_core::ui::{
     self, NoteApp, NoteAppProps, NoteIntents, NoteViewModel, Phase, SurfaceData,
 };
@@ -44,6 +48,13 @@ pub enum HostMessage {
     Intent(&'static str),
     /// 표면 포인터 — 표면 DIP 좌표.
     Pointer(PointerPhase, f64, f64),
+    /// 백그라운드에서 만든 정적 레이어 — `generation`은 낡은 결과를 버리는 기준,
+    /// `count`는 그 PNG가 반영한 확정 스트로크 수다.
+    StaticLayer {
+        generation: u64,
+        count: usize,
+        png: Option<Vec<u8>>,
+    },
     /// 백그라운드에서 읽은 PDF 파일.
     Opened(Result<files::OpenedFile, String>),
     /// 백그라운드 내보내기 결과(저장된 경로).
@@ -64,7 +75,19 @@ pub struct Shell {
     /// 표면 재료(정적 PNG + 라이브 선분). 발행 직전에 `<Raw>`로 넘긴다.
     surface: InkSurface,
     /// 정적 레이어를 다시 만들어야 하는가(획 커밋/되돌리기/페이지 이동/줌).
+    ///
+    /// 이 플래그가 서 있으면 표면을 갱신하는 김에 **백그라운드**에 맡긴다
+    /// ([`Shell::request_static`]) — UI 스레드는 래스터/인코딩을 기다리지 않는다.
     surface_dirty: bool,
+    /// 화면에 있는 정적 PNG가 반영한 확정 스트로크 수.
+    ///
+    /// 그 뒤에 확정된 획은 PNG에 없으므로 라이브 레이어가 계속 그린다
+    /// ([`pending_lines`]) — 렌더가 끝나기 전에 그은 획도 화면에 남는다.
+    static_snapshot: usize,
+    /// 진행 중인 정적 렌더의 세대(없으면 `None`) — 한 번에 하나만 돌린다.
+    static_inflight: Option<u64>,
+    /// 세대 카운터 — 낡은 렌더 결과를 버리는 기준(되돌리기/지우개/페이지 이동/줌).
+    static_generation: u64,
     /// 포인터 드래그가 진행 중인가.
     drawing: bool,
     /// 속도 기반 압력 계산용 마지막 샘플.
@@ -89,30 +112,96 @@ impl Shell {
         self.pdf.as_ref().map(PdfDocument::file_name)
     }
 
-    /// 표면을 최신으로 만든다 — **정적 레이어는 필요할 때만**, 라이브는 매번.
+    /// 표면을 최신으로 만든다 — **정적은 백그라운드, 라이브는 즉시**.
     ///
-    /// 이 한 줄이 "잉크가 많아도 입력이 끊기지 않는다"의 근거다: 드래그 중에는
-    /// 확정 PNG를 다시 만들지 않고 선분 몇 개만 갈아 끼운다.
-    fn refresh_surface(&mut self) {
+    /// 이 구분이 "획을 끝내도 화면이 멈추지 않는다"의 근거다:
+    /// - 정적 레이어(A4 = 13ms release / 277ms dev)는 워커가 만들고 결과를 메시지로 받는다.
+    /// - 라이브 레이어는 선분 몇 개만 갈아 끼운다(600점 = 0.1ms).
+    /// - PNG가 도착하기 전에 확정된 획은 꼬리로 남아 라이브 레이어가 그린다.
+    fn refresh_surface(&mut self, context: &ComponentContext<Self>) {
         let size = self.document.active_page().size();
         let scale = self.scale();
         let (width, height) = page_pixel_size(size, scale);
 
-        if self.surface_dirty
-            || self.surface.width != width
+        let geometry_changed = self.surface.width != width
             || self.surface.height != height
-            || (self.surface.scale - scale).abs() > 1e-4
-        {
-            self.surface =
-                InkSurface::build(size, scale, self.document.committed_strokes(), None);
-            self.surface_dirty = false;
+            || (self.surface.scale - scale).abs() > 1e-4;
+        if geometry_changed {
+            self.surface.width = width;
+            self.surface.height = height;
+            self.surface.scale = scale;
+            // 크기/배율이 바뀌면 화면의 PNG는 **다른 그림**이다 — 지우고 새로 만든다.
+            self.clear_static();
         }
 
-        self.surface.lines = self
-            .document
-            .live_stroke()
-            .map(|stroke| live_lines(stroke, scale))
-            .unwrap_or_default();
+        if self.surface_dirty && self.static_inflight.is_none() {
+            self.surface_dirty = false;
+            self.request_static(context, size);
+        }
+
+        self.surface.lines = pending_lines(
+            self.document.committed_strokes(),
+            self.static_snapshot,
+            self.document.live_stroke(),
+            scale,
+        );
+    }
+
+    /// 정적 레이어를 **백그라운드에** 맡긴다 — UI 스레드는 여기서 기다리지 않는다.
+    ///
+    /// 스트로크 목록을 **스냅샷으로 복사**해 넘기고(`Stroke`는 `Send`), 결과는
+    /// [`HostMessage::StaticLayer`]로 돌아온다. 그 사이 문서가 또 바뀌면 세대가 달라져
+    /// 낡은 결과는 버려진다([`Shell::mark_static_dirty`]).
+    fn request_static(&mut self, context: &ComponentContext<Self>, size: Size) {
+        let committed = self.document.committed_strokes();
+        if !has_ink(committed) {
+            // 그릴 잉크가 없다 — 워커도 PNG도 필요 없다(빈 페이지).
+            self.surface.static_png = None;
+            self.static_snapshot = committed.len();
+            return;
+        }
+
+        let strokes: Vec<Stroke> = committed.to_vec();
+        let count = strokes.len();
+        let scale = self.surface.scale;
+        self.static_generation += 1;
+        let generation = self.static_generation;
+        self.static_inflight = Some(generation);
+
+        let _ = context.spawn_background(move |_cancel| HostMessage::StaticLayer {
+            generation,
+            count,
+            png: static_layer(&strokes, size, scale),
+        });
+    }
+
+    /// 백그라운드가 만든 PNG를 받는다 — **최신 세대만** 받는다.
+    fn adopt_static(&mut self, generation: u64, count: usize, png: Option<Vec<u8>>) {
+        if self.static_inflight != Some(generation) {
+            return; // 그 사이 되돌리기/지우개/페이지 이동이 있었다 — 낡은 그림이다
+        }
+        self.static_inflight = None;
+        self.surface.static_png = png;
+        // 이 PNG가 반영한 확정 스트로크 수 — 렌더 중에 더 그은 획은 라이브로 남는다.
+        self.static_snapshot = count.min(self.document.committed_strokes().len());
+    }
+
+    /// 정적 레이어가 **낡았다**고 표시한다(같은 페이지/배율, 내용만 바뀐 경우).
+    ///
+    /// 화면의 PNG는 그대로 둔다(되돌리기 직후 옛 잉크가 한 프레임 남는 편이 빈 페이지가
+    /// 번쩍이는 것보다 낫다). 진행 중이던 렌더 결과는 버린다 — 세대를 올려 도착해도
+    /// 반영되지 않게 한다(되돌린 스트로크가 되살아나지 않는다).
+    fn mark_static_dirty(&mut self) {
+        self.surface_dirty = true;
+        self.static_snapshot = self.document.committed_strokes().len();
+        self.static_generation += 1;
+        self.static_inflight = None;
+    }
+
+    /// 화면의 PNG를 버린다 — 페이지/배율이 바뀌어 다른 그림이 됐을 때.
+    fn clear_static(&mut self) {
+        self.surface.static_png = None;
+        self.mark_static_dirty();
     }
 
     /// 포인터 한 점 — 모델에 반영한다.
@@ -152,15 +241,25 @@ impl Shell {
                     .extend(InkPoint::with_pressure(point.x, point.y, pressure));
             }
             PointerPhase::Released if self.drawing => {
-                self.document.finish();
                 self.drawing = false;
-                self.surface_dirty = true;
+                match self.document.finish() {
+                    // 스트로크 하나가 **늘었다** — 기존 PNG는 그대로 쓸 수 있다.
+                    // 새 획은 PNG가 도착할 때까지 라이브 레이어가 꼬리로 그린다.
+                    Some(Edit::AddStroke { .. }) => self.surface_dirty = true,
+                    // 지운 결과는 PNG에 반영돼야 한다(화면의 PNG는 옛 상태다).
+                    Some(_) => self.mark_static_dirty(),
+                    None => {}
+                }
                 self.status = self.document.status_line();
             }
             PointerPhase::Canceled if self.drawing => {
-                self.document.cancel();
                 self.drawing = false;
-                self.surface_dirty = true;
+                self.document.cancel();
+                // 취소는 드래그 **직전 상태**로 되돌린다 — 화면의 PNG가 이미 그 상태면
+                // 다시 그릴 필요가 없다(포인터 캡처 유실에서 화면이 멈추지 않는다).
+                if self.document.committed_strokes().len() != self.static_snapshot {
+                    self.mark_static_dirty();
+                }
                 self.status = "획을 취소했습니다".to_string();
             }
             _ => {}
@@ -189,14 +288,14 @@ impl Shell {
                     Some(edit) => format!("{} — 되돌렸습니다", edit.label()),
                     None => "되돌릴 편집이 없습니다".to_string(),
                 };
-                self.surface_dirty = true;
+                self.mark_static_dirty();
             }
             "redo" => {
                 self.status = match self.document.redo() {
                     Some(edit) => format!("{} — 다시 적용", edit.label()),
                     None => "다시 적용할 편집이 없습니다".to_string(),
                 };
-                self.surface_dirty = true;
+                self.mark_static_dirty();
             }
             "clear" => {
                 self.status = if self.document.clear_active_page() {
@@ -204,7 +303,7 @@ impl Shell {
                 } else {
                     "비울 스트로크가 없습니다".to_string()
                 };
-                self.surface_dirty = true;
+                self.mark_static_dirty();
             }
             "open" => self.open_pdf(context),
             "export_png" => self.export_png(context),
@@ -213,7 +312,7 @@ impl Shell {
                 let size = self.document.active_page().size();
                 self.document.add_page_after_active(size);
                 self.status = self.document.status_line();
-                self.surface_dirty = true;
+                self.clear_static();
             }
             "page_remove" => {
                 let index = self.document.active_index();
@@ -222,17 +321,17 @@ impl Shell {
                 } else {
                     "마지막 페이지는 지울 수 없습니다".to_string()
                 };
-                self.surface_dirty = true;
+                self.clear_static();
             }
             "page_prev" => {
                 if self.document.step_page(-1) {
-                    self.surface_dirty = true;
+                    self.clear_static();
                     self.status = self.document.status_line();
                 }
             }
             "page_next" => {
                 if self.document.step_page(1) {
-                    self.surface_dirty = true;
+                    self.clear_static();
                     self.status = self.document.status_line();
                 }
             }
@@ -339,7 +438,7 @@ impl Shell {
                 self.phase = Phase::Failed(error.to_string());
             }
         }
-        self.surface_dirty = true;
+        self.clear_static();
     }
 }
 
@@ -347,7 +446,7 @@ impl Component for Shell {
     type Input = ();
     type Message = HostMessage;
 
-    fn create(_input: &(), _context: &ComponentContext<Self>) -> Self {
+    fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
         let mut shell = Self {
             document: Document::blank(Size::A4),
             pdf: None,
@@ -358,11 +457,14 @@ impl Component for Shell {
             phase: Phase::Empty,
             surface: InkSurface::build(Size::A4, ViewTransform::DEFAULT_SCALE, &[], None),
             surface_dirty: true,
+            static_snapshot: 0,
+            static_inflight: None,
+            static_generation: 0,
             drawing: false,
             last_sample: None,
             status: "새 노트 — 펜으로 그려 보세요".to_string(),
         };
-        shell.refresh_surface();
+        shell.refresh_surface(context);
         shell
     }
 
@@ -370,6 +472,11 @@ impl Component for Shell {
         match message {
             HostMessage::Intent(name) => self.intent(name, context),
             HostMessage::Pointer(phase, x, y) => self.pointer(phase, x, y),
+            HostMessage::StaticLayer {
+                generation,
+                count,
+                png,
+            } => self.adopt_static(generation, count, png),
             HostMessage::Opened(Ok(file)) => self.adopt_pdf(file),
             HostMessage::Opened(Err(error)) => {
                 self.status = error.clone();
@@ -381,8 +488,9 @@ impl Component for Shell {
                 self.phase = Phase::Failed(error);
             }
         }
-        // 어떤 메시지든 표면을 최신으로 맞춘다(정적은 필요할 때만).
-        self.refresh_surface();
+        // 어떤 메시지든 표면을 최신으로 맞춘다 — 정적은 필요할 때 백그라운드에 맡기고,
+        // 라이브(진행 중인 획 + 아직 PNG에 없는 꼬리)는 여기서 바로 만든다.
+        self.refresh_surface(context);
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
