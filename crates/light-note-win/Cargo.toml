@@ -1,0 +1,23 @@
+[package]
+name = "light-note-win"
+description = "light-note의 WinUI 3(WinUI 3 / windows-reactor) 호스트 — 윈도우 11 전용"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 이 크레이트는 Windows에서만 컴파일된다(모듈이 전부 cfg(windows)다).
+# 리눅스에서는 `cargo check -p light-note-core`로 계약을 검증하고, WinUI 층은
+# Windows에서 `cargo build -p light-note-win`으로 빌드한다.
+
+[dependencies]
+light-note-core = { path = "../light-note-core", version = "0.1.0" }
+elm-magic.workspace = true
+elm-magic-windows-reactor.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-reactor.workspace = true
+rfd.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+# 리눅스에서는 호스트가 컴파일되지 않는다 — 아래 `[[bin]]`의 required-features로 막는다.

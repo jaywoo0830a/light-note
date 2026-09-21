@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/light-note-core", "crates/light-note-win"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+
+[workspace.dependencies]
+# UI — 상태는 변수, 이벤트는 대입, 화면은 함수 본문 (elm-magic)
+elm-magic = "0.8.7"
+# WinUI 3(windows-reactor) 어댑터 — 리눅스에서도 계획(plan) 층은 컴파일된다.
+elm-magic-windows-reactor = "0.8.7"
+# PDF 해석/래스터화 (순수 Rust). Pixmap·vello_cpu 래스터 엔진을 재수출한다.
+hayro = "0.7"
+# PDF 작성 (hayro-write가 쓰는 writer)
+pdf-writer = "0.15"
+# 선언적 WinUI 3 런타임 — Windows 전용
+windows-reactor = "0.100"
+# 네이티브 파일 대화상자(IFileDialog) — Windows 전용
+rfd = "0.15"
