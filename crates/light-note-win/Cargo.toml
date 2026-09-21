@@ -20,4 +20,5 @@ windows-reactor.workspace = true
 rfd.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
-# 리눅스에서는 호스트가 컴파일되지 않는다 — 아래 `[[bin]]`의 required-features로 막는다.
+# 리눅스/맥에서는 WinUI 모듈이 전부 cfg(windows)로 빠지고 `src/main.rs`는 안내만
+# 출력한다 — 그래서 여기에 넣을 의존성이 없다. 빌드/실행은 `run-windows.ps1` 참고.

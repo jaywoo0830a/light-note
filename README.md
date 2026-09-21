@@ -46,8 +46,35 @@ cargo test -p light-note-core
 ## 실행 (윈도우 11)
 
 ```powershell
-cargo run -p light-note-win --release
+# 전제조건 점검 → 코어 계약 테스트 → 릴리스 빌드 → 실행 (한 번에)
+powershell -ExecutionPolicy Bypass -File .\run-windows.ps1
+
+# 전제조건만 / 테스트만 / 컴파일만 / 빌드만
+powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Prereq
+powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Test
+powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Check
+powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Build
 ```
+
+스크립트 없이 직접:
+
+```powershell
+cargo test  -p light-note-core
+cargo run   -p light-note-win --release
+```
+
+### 전제조건 (`run-windows.ps1`이 직접 확인한다)
+
+| 항목 | 없을 때 |
+|---|---|
+| PowerShell 5.1+ (윈도우) | — |
+| rustup + **MSVC** 툴체인 (`x86_64-pc-windows-msvc`) | `rustup toolchain install stable-x86_64-pc-windows-msvc` |
+| Visual Studio Build Tools (C++ 도구, `link.exe`) | `winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
+| **Windows App Runtime 2.4** (`Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe`) | `-InstallRuntime`(winget) 또는 `-OpenDownloads` — [다운로드](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) |
+
+마지막 항목은 `windows-reactor` 0.100의 `bootstrap_runtime()`이 요구하는 것이다
+(`src/native/winui/bootstrap.rs`의 `FRAMEWORK_FAMILY` / 버전 상수 = 2.4). 없으면 앱이
+설치 안내 대화상자를 띄우고 `0x8007007E`로 죽는다 — 스크립트가 미리 잡아 준다.
 
 ## Windows 11 최적화 포인트
 
