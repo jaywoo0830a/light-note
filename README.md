@@ -35,13 +35,48 @@ crates/light-note-win    WinUI 3 호스트 — 윈도우 11 전용 (포인터/�
 cargo test -p light-note-core
 ```
 
-51개 테스트가 **UI 계약까지** 검증한다:
+57개 테스트가 **UI 계약과 인코딩 규칙까지** 검증한다(윈도우에서도 그대로 돈다):
 
 - `ink_model` — 샘플 필터/필압/경계/지우개 히트 테스트
 - `document` — Undo/Redo(지우개 드래그 = 편집 하나), 페이지 관리, 취소
 - `raster` — 잉크가 **어디에** 올라갔는지 픽셀로 확인, 결정성, PNG 왕복
 - `export` — 내보낸 PDF를 **hayro로 다시 읽어** 배경/잉크 위치까지 검증
 - `ui_plan` — 버튼 → 의도 매핑, 상태 분기(로딩/빈/준비/실패), `<Raw>` 표면 전달
+- `encoding` — `.ps1`의 **UTF-8 BOM**, 모든 텍스트 파일의 UTF-8/CRLF 계약
+  (Windows PowerShell 5.1이 BOM 없는 `.ps1`을 ANSI로 읽어 파싱이 죽던 사고의 재발 방지)
+
+## 인코딩 규칙 (윈도우 최적화)
+
+| 파일 | 인코딩 | 줄바꿈 | 이유 |
+|---|---|---|---|
+| `*.ps1` | **UTF-8 with BOM** | CRLF | Windows PowerShell **5.1**은 BOM 없는 `.ps1`을 **ANSI(CP949)**로 읽는다 |
+| `*.rs` `*.toml` `*.md` 등 | UTF-8 **without** BOM | CRLF | rustc/cargo/깃은 항상 UTF-8 — BOM은 이득 없이 diff만 흔든다 |
+
+`.ps1`에 BOM이 없으면 **한글이 깨지는 정도로 끝나지 않는다**: UTF-8 한글 바이트가 CP949의
+2바이트 조합으로 재해석되면서 문자열 종결자 `'` 하나가 삼켜지고, "문자열에 종결자가 없습니다"와
+`}`/`)` 누락 오류가 캐스케이드로 쏟아진다(실제로 겪은 사고 — 파일 내용은 정상이었다).
+
+사람의 주의력 대신 **기계 세 개**가 지킨다:
+
+- `.editorconfig` — 에디터가 **저장하는 순간** `.ps1`은 `utf-8-bom`, 나머지는 `utf-8`로 쓴다.
+- `.gitattributes` — 줄바꿈을 각 PC의 `core.autocrlf`가 아니라 저장소가 정한다(텍스트=CRLF).
+- `crates/light-note-core/tests/encoding.rs` — 실제 바이트를 검사한다(BOM·UTF-8·NUL·CRLF).
+  `run-windows.ps1`이 **가장 먼저** 돌리는 `cargo test -p light-note-core`에 포함되므로,
+  같은 사고는 스크립트를 돌리는 순간 바로 잡힌다.
+
+새 `.ps1`을 만들 때:
+
+```powershell
+# VS Code: 우하단 인코딩 표시를 'UTF-8 with BOM'으로 저장
+Set-Content -LiteralPath .\new.ps1 -Encoding utf8BOM -Value $text   # 5.1/7 공통
+```
+
+- **`.bat`/`.cmd`에는 한글을 쓰지 않는다** — `cmd.exe`는 OEM 코드페이지로 읽고 BOM도 제대로
+  다루지 못한다. 필요하면 `.ps1`로 쓴다.
+- `working-tree-encoding=UTF-8-BOM` 같은 git 속성은 **쓰지 않는다**(깃 문서가 BOM 처리 문제로
+  권장하지 않는다) — BOM은 파일 안의 실제 바이트로 둔다.
+- 콘솔에서 한글이 깨지면 `chcp 65001` — 스크립트는 스스로 `[Console]::OutputEncoding`을
+  UTF-8로 맞춘다.
 
 ## 실행 (윈도우 11)
 

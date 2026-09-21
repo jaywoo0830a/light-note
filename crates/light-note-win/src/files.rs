@@ -7,7 +7,7 @@
 //! - PDF **파싱**은 `hayro`가 지연 파싱(xref/trailer만 먼저)이라 UI 스레드에서 해도 싸다.
 //!   무거운 **렌더**는 필요한 순간에만 한다(`PdfDocument::render_page`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 연 파일 — 경로 + 바이트 (둘 다 `Send`).
 #[derive(Clone, Debug)]
@@ -62,8 +62,5 @@ pub fn pick_folder(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_folder()
 }
 
-/// 바이트를 파일로 쓴다 — **백그라운드**에서 부른다.
-pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
-    std::fs::write(path, bytes).map_err(|error| format!("파일을 쓰지 못했습니다: {error}"))?;
-    Ok(path.to_path_buf())
-}
+// 파일 **쓰기**는 여기 없다 — 내보내기(코어의 `export`)가 배경에서 직접 쓴다.
+// 이 모듈은 대화상자와 **읽기**만 맡는다(그래서 미사용 `write_bytes`는 지웠다).

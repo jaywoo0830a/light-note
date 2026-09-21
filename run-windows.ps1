@@ -1,4 +1,11 @@
-<#
+﻿<#
+⚠ 이 파일은 **UTF-8 BOM(EF BB BF)** 이다 — 지우지 마라.
+       Windows PowerShell 5.1은 BOM 없는 .ps1을 **ANSI(CP949)**로 읽는다. 그러면 한글이
+       깨지는 정도가 아니라 문자열 종결자 `'` 하나가 멀티바이트쌍으로 먹혀
+       "문자열에 종결자가 없습니다" 파싱 오류 5개가 쏟아진다(이 파일에서 실제로 겪었다 —
+       파일 내용은 정상이었고 인코딩만 문제였다). 그래서 이 저장소는 **.ps1에만** BOM을 쓴다.
+       지키는 것: `.editorconfig`(에디터가 저장할 때) · `.gitattributes`(CRLF) ·
+       `crates/light-note-core/tests/encoding.rs`(테스트가 검사).
 .SYNOPSIS
     light-note를 윈도우 11에서 점검 → 테스트 → 빌드 → 실행한다.
 
@@ -17,7 +24,8 @@
          없으면 앱이 설치 안내 대화상자를 띄우고 `0x8007007E`로 죽는다.
 
     **리눅스/맥에서는 아무것도 빌드하지 않는다** — WinUI 층은 `cfg(windows)`라
-    컴파일 대상이 아니다. 그쪽에서는 `cargo test -p light-note-core`(52개 계약 테스트).
+    컴파일 대상이 아니다. 그쪽에서는 `cargo test -p light-note-core`(계약 테스트 전부 —
+    인코딩 규칙 검사까지 포함).
 
     스크립트 없이 같은 일을 하는 명령(저장소 루트에서):
         cargo test  -p light-note-core
@@ -155,7 +163,7 @@ function Test-Prereq {
     if (-not $onWindows) {
         Write-Warn2 '이 스크립트는 윈도우 전용이다 (WinUI 3 / Windows App Runtime 필요).'
         Write-Warn2 '리눅스/맥에서는 WinUI 호스트가 컴파일되지 않는다.'
-        Write-Fix '리눅스/맥: cargo test -p light-note-core   (52개 계약 테스트가 전부 돈다)'
+        Write-Fix '리눅스/맥: cargo test -p light-note-core   (계약 테스트 전부 — 인코딩 규칙까지 돈다)'
         exit 2
     }
     Write-Ok "윈도우 $([System.Environment]::OSVersion.Version) / PowerShell $($PSVersionTable.PSVersion)"
@@ -310,7 +318,7 @@ if ($Clean) {
 
 if ($Test) {
     Invoke-Cargo -CargoArgs @('test', '-p', 'light-note-core')
-    Write-Host '코어 계약 테스트 통과 (52개)' -ForegroundColor Green
+    Write-Host '코어 계약 테스트 통과 (UI 계약 + 인코딩 규칙)' -ForegroundColor Green
     exit 0
 }
 

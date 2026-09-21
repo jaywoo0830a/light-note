@@ -1,0 +1,23 @@
+# 줄바꿈/바이너리 취급을 **각 PC의 깃 설정이 아니라 저장소가** 정하게 한다.
+#
+# 왜 저장소가 정하나: 이 앱은 윈도우 11 전용이고, `.ps1`은 Windows PowerShell 5.1이
+# 읽는다. 다른 PC에서 `core.autocrlf=false`로 클론하면 .ps1이 LF만 남는데,
+# 그 상태를 각자 다르게 다루면 "내 PC에서는 되는데"가 시작된다(윈도우 도구 대부분은 CRLF 기본).
+#
+# 인코딩(BOM)은 여기서 다루지 **않는다**:
+#   BOM은 파일 안의 **실제 바이트**로 둔다(EF BB BF). `working-tree-encoding=UTF-8-BOM`
+#   같은 속성은 깃 문서가 BOM 처리 문제로 권장하지 않는다 — 잃어버리면 5.1이 ANSI로
+#   읽어 파싱이 죽으므로, 검사는 tests/encoding.rs가 한다.
+#
+# 텍스트 = 워크트리 CRLF / 인덱스 LF(깃 표준). 이진은 절대 변환하지 않는다.
+* text=auto eol=crlf
+
+*.{ps1,psm1,psd1,ps1xml} text eol=crlf
+*.rs text eol=crlf
+*.toml text eol=crlf
+*.md text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

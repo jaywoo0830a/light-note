@@ -10,8 +10,10 @@
 //!
 //! ## windows-reactor 0.100.0의 사실에 맞춘 이유
 //! - **포인터 이벤트는 `Border`에만 있다**(`on_pointer_pressed/moved/released/capture_lost`,
-//!   `capture_pointer_on_press`). `Canvas`·`StackPanel`에는 없다 — 그래서 `Border`가 입력을 받고
-//!   `Canvas`가 그림을 담는다.
+//!   `on_pointer_canceled`, `capture_pointer_on_press`). `Canvas`·`StackPanel`에는 없다 —
+//!   그래서 `Border`가 입력을 받고 `Canvas`가 그림을 담는다. **취소는 두 경로로 온다**:
+//!   포인터 캡처 상실(`capture_lost`)과 시스템 취소(`canceled`) — 둘 다
+//!   `PointerPhase::Canceled`로 모여 진행 중인 획을 되돌린다(모델이 한 점만 남기지 않도록).
 //! - **`Canvas`가 유일한 절대 좌표 컨테이너**다(`CanvasChildExt::canvas_left/canvas_top`).
 //! - **가속기는 `Grid`에만 붙는다**(`Grid::key_accelerators`). 높이가 내용만큼이라
 //!   레이아웃에 영향을 주지 않는다.
@@ -93,6 +95,7 @@ pub fn build(data: &SurfaceData, sink: &PointerSink, accelerators: KeyAccelerato
             released(PointerPhase::Released, info.x, info.y)
         })
         .on_pointer_capture_lost(move || lost(PointerPhase::Canceled, 0.0, 0.0))
+        .on_pointer_canceled(move || canceled(PointerPhase::Canceled, 0.0, 0.0))
         .content(canvas);
 
     Some(

@@ -1,0 +1,32 @@
+# 에디터가 **저장하는 순간** 올바른 인코딩을 쓰게 한다 (윈도우 최적화).
+#
+# 규칙이 왜 이렇게 생겼나: `run-windows.ps1`이 UTF-8(BOM 없음)이었고
+# Windows PowerShell **5.1**이 그 파일을 ANSI(CP949)로 읽어 한글이 깨지고
+# 문자열 종결자 `'` 하나가 멀티바이트쌍으로 먹혀 파싱이 죽었다(오류 5개).
+# → .ps1만 BOM을 쓴다. 이 규칙은 tests/encoding.rs가 기계로 검사한다.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+
+# Windows PowerShell 5.1은 BOM 없는 스크립트/모듈/매니페스트를 ANSI로 읽는다 → **BOM 필수**.
+# (.ps1만이 아니다 — .psm1·.psd1·.ps1xml도 5.1이 같은 방식으로 읽는다.)
+[*.{ps1,psm1,psd1,ps1xml}]
+charset = utf-8-bom
+
+# 이진/생성물: 에디터가 인코딩이나 줄바꿈을 건드리지 않게 한다.
+[*.{png,jpg,jpeg,pdf}]
+charset = unset
+end_of_line = unset
+
+# 마크다운은 줄 끝 공백 두 개가 "줄바꿈"이라는 뜻이다 — 지우면 문단이 합쳐진다.
+[*.md]
+trim_trailing_whitespace = false
+
+# `cmd.exe`는 OEM 코드페이지를 쓴다 — .bat/.cmd에 한글을 넣지 않는다(README 참고).
+[*.{bat,cmd}]
+charset = utf-8

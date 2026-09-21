@@ -23,12 +23,27 @@ use light_note_core::ui::{
 /// 표면 빌더가 받은 재료를 기록한다(호스트 대역).
 static SEEN_SURFACE: Mutex<Option<SurfaceData>> = Mutex::new(None);
 
+/// 빌더가 슬롯을 "채웠다"를 표현하는 값 — **플랫폼마다 타입이 다르다**.
+///
+/// Windows의 슬롯은 어댑터의 `RawSlot`(= `Option<windows_reactor::View>`)이고
+/// 뷰는 WinUI 스레드에서만 만들어진다 — 그래서 **헤드리스 테스트는 슬롯을 채울 수
+/// 없다**. Windows에서는 `None`을 돌려주고, "빌더가 불렸다"는 기록된 재료로 확인한다.
+#[cfg(not(windows))]
+fn filled_slot() -> SurfaceSlot {
+    Some(())
+}
+
+#[cfg(windows)]
+fn filled_slot() -> SurfaceSlot {
+    None
+}
+
 fn recording_builder(data: &SurfaceData) -> SurfaceSlot {
     let mut slot = SEEN_SURFACE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(data.clone());
-    Some(())
+    filled_slot()
 }
 
 fn props(view: &NoteViewModel, log: &Rc<RefCell<Vec<&'static str>>>) -> NoteAppProps {
@@ -254,7 +269,14 @@ fn surface_data_reaches_the_registered_builder_through_raw() {
 
     let mut slot: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut slot);
-    assert_eq!(slot, Some(()), "<Raw>가 빌더를 불러 슬롯을 채운다");
+    // 슬롯이 채워졌는지는 플랫폼에 달렸다 — 헤드리스(비-Windows)는 `Some(())`이지만
+    // Windows 슬롯은 `Option<View>`라 뷰(WinUI 스레드) 없이는 채울 수 없다.
+    // 어느 쪽이든 **빌더가 불렸다**는 사실은 아래 `SEEN_SURFACE`로 확인한다.
+    assert_eq!(
+        slot.is_some(),
+        cfg!(not(windows)),
+        "<Raw>가 등록된 빌더를 부른다"
+    );
 
     let seen = SEEN_SURFACE
         .lock()
@@ -267,7 +289,7 @@ fn surface_data_reaches_the_registered_builder_through_raw() {
     // 발행 한 번 = 스테이징 한 번: 두 번째 호출은 빈손이다.
     let mut second: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut second);
-    assert_eq!(second, None, "스테이징은 소비된다(프레임당 한 번)");
+    assert!(second.is_none(), "스테이징은 소비된다(프레임당 한 번)");
 
     clear_surface_builder();
 }
