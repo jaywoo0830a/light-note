@@ -1,9 +1,11 @@
 //! 계측 도구 — 표면 한 장에 드는 비용(필기감의 근거).
 //!
-//! UI 스레드에서 도는 두 가지를 잰다:
-//! - **정적 레이어 재생성**(`InkSurface::build`) — 획을 확정할 때 한 번. 페이지 전체를
-//!   CPU로 래스터화하고 PNG로 인코딩한다.
-//! - **라이브 선분**(`live_lines`) — 포인터가 움직일 때마다. 진행 중인 획 하나만.
+//! 재는 것:
+//! - **정적 레이어**(`InkSurface::build`/`static_layer`) — 획을 확정할 때 한 번. 페이지
+//!   전체를 CPU로 래스터화하고 PNG로 인코딩한다. **워커에서 도는 비용**이다(UI 스레드는
+//!   기다리지 않는다) — 그래도 얼마인지 알아야 "왜 백그라운드로 뺐는가"를 판단할 수 있다.
+//! - **라이브 선분**(`pending_lines`/`live_lines`) — 포인터가 움직일 때마다 **UI 스레드에서**.
+//!   진행 중인 획 하나 + 아직 PNG에 없는 꼬리.
 //!
 //! 실행: `cargo run --release -p light-note-core --example surface_cost`
 
@@ -55,7 +57,7 @@ fn main() {
         (width as f64 * height as f64) / 1e6
     );
 
-    println!("── 정적 레이어(획 확정 때 UI 스레드에서) ──");
+    println!("── 정적 레이어(획 확정 때 워커에서 도는 비용) ──");
     for count in [1usize, 5, 20, 60] {
         let document = page_with(count);
         let committed = document.committed_strokes();
@@ -102,9 +104,10 @@ fn main() {
     let committed = page_with(20);
     let strokes = committed.committed_strokes();
     let count = strokes.len();
-    time("pending_lines — 방금 확정한 획 하나(꼬리)", || {
-        pending_lines(&strokes[..count - 1], count - 1, None, scale)
-    });
+    time(
+        "pending_lines — 방금 확정한 획 하나(꼬리)",
+        || pending_lines(&strokes[..count - 1], count - 1, None, scale),
+    );
 
     println!("\n── 프레임마다 도는 부수 비용 ──");
     let document = page_with(20);
