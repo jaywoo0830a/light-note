@@ -135,9 +135,34 @@ pub fn latest() -> Option<PointerFrame> {
     LATEST.get()
 }
 
-/// 디지타이저(펜)를 한 번이라도 봤는가.
+/// 디지타이저(펜)를 한 번이라도 봤는가 — **호버만 해도 참**이다(접촉은 프레임의 자격이다).
 pub fn seen_pen() -> bool {
     SEEN_PEN.get()
+}
+
+/// 상태 띠 배지의 **문장** — 펜 입력이 왜 잉크가 안 되는지 한 줄로 말한다.
+///
+/// 배지는 사용자가 **가장 먼저** 읽는 문장이다. 그래서 "펜이 안 잡힌다"로 끝내지 않고 **왜**를
+/// 말한다 — 관문 순서대로: ① 훅이 안 걸렸으면 그 이유, ② 펜을 봤으면 그것, ③ 못 봤으면 그 이유
+/// (포인터가 오는데 펜이 아닌가 / 마우스로 오는가 / 아무것도 안 오는가).
+///
+/// 순수 함수라 화면 없이 검증한다(정적값은 인자로 온다).
+pub fn input_badge(state: HookState, seen_pen: bool, messages: u32, mouse: u32) -> String {
+    if !state.is_hooking() {
+        return state.reason().to_string();
+    }
+    if seen_pen {
+        return "Pen — digitizer active".to_string();
+    }
+    if messages > 0 {
+        // 포인터 메시지는 오는데 `PT_PEN`이 아니다 — 터치이거나 마우스 포인터다.
+        "Pen only — pointer input is not a pen".to_string()
+    } else if mouse > 0 {
+        // `WM_POINTER`가 **하나도** 없고 마우스만 온다 = 펜을 마우스로 내보내는 드라이버다.
+        "Pen only — input arrives as mouse (check the tablet driver)".to_string()
+    } else {
+        "Pen only — no pen detected yet".to_string()
+    }
 }
 
 // ── 진단 (개발자 도구가 읽는다) ────────────────────────────────────
@@ -169,7 +194,11 @@ impl Digitizer {
     /// 진단 줄에 쓸 한 줄(**영어만**) — 펜이 없으면 그 사실이 맨 앞에 온다.
     pub fn summary(self) -> String {
         if !self.present {
-            return "none reported — this system has no tablet input".to_string();
+            // **거짓 결론을 피한다**: 이 지표(`SM_DIGITIZER`)는 내장 디지타이저 기준이라
+            // USB 펜·가상 펜(예: OTD의 VMulti)에서는 **0으로 나온다**(실측: 펜 장치가 등록돼
+            // 있는데도 0). 그래서 "펜이 없다"가 아니라 "여기에는 안 잡힌다"까지만 말한다.
+            return "0 — no tablet reported by this metric (USB and virtual pens often report 0)"
+                .to_string();
         }
         let mut kinds: Vec<&str> = Vec::new();
         if self.integrated_pen {
@@ -261,7 +290,7 @@ pub struct Probe {
     pub hooked: bool,
     /// 이 창이 받은 `WM_POINTER*` 메시지 수.
     pub messages: u32,
-    /// 그중 **펜**이었던 수.
+    /// 그중 **펜**이었던 수 — **호버도 센다**(접촉 여부는 프레임의 자격이지 펜의 자격이 아니다).
     pub pen: u32,
     /// 이 창이 받은 **마우스** 메시지 수(`WM_MOUSEMOVE`·`WM_LBUTTONDOWN`·`WM_LBUTTONUP`).
     ///
@@ -335,11 +364,20 @@ impl Digest {
                 "none found on this thread".to_string(),
             ));
         }
-        // 펜이 없는 기계라면 그 사실이 **결론**이다 — 아래 숫자는 볼 필요도 없다.
+        // 펜이 안 잡히는 기계라면 그 사실이 **실마리**다 — 다만 이 지표는 **결론이 아니다**(아래 참조).
         if !self.digitizer.has_pen() {
             rows.push((
                 "Hint".to_string(),
-                "ink needs a pen digitizer — mouse and touch never draw".to_string(),
+                "the system metric reports no pen — USB and virtual pens often report 0 here; judge \
+                 by the device list and the per-window counters instead"
+                    .to_string(),
+            ));
+        }
+        // 펜을 봤는데 접촉 프레임이 아직 없다 = **호버 중**이다(접촉 전 업데이트는 프레임이 아니다).
+        if self.seen_pen && self.last.is_none() {
+            rows.push((
+                "Hint".to_string(),
+                "the pen is in range but not in contact — touch the surface to draw".to_string(),
             ));
         }
         // 펜 메시지는 없는데 **마우스**만 오고 있다면 그게 결론이다: 펜을 마우스로 내보내는 드라이버다.
@@ -790,11 +828,15 @@ mod win32 {
         if matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP) {
             count(data);
             let id = (wparam.0 & POINTER_ID_MASK) as u32;
-            // **접촉 중인가**(`POINTER_FLAG_INCONTACT`): 호버 업데이트까지 프레임으로 만들면
-            // 공중에 띄운 펜이 마우스 드래그에 "펜 자격"을 붙인다(거짓). DOWN/UP은 접촉의
-            // 시작·끝 그 자체라 그대로 받는다.
+            // **종류가 먼저, 접촉이 다음**이다: 펜을 봤다는 사실은 **호버에도** 참이다(WinUI는
+            // 접촉 전에도 `WM_POINTERUPDATE`를 보낸다). 접촉 여부는 *프레임*의 자격이지 펜의
+            // 자격이 아니다 — 순서를 뒤집으면 공중에 띄운 펜을 "펜이 없다"고 말하게 된다(거짓).
+            let device = pointer_kind(id);
+            if device == Device::Pen {
+                count_pen(data);
+            }
             if message != WM_POINTERUPDATE || in_contact(id) {
-                record(data, id);
+                record(id, device);
             }
         } else if matches!(message, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
             // **펜이 안 오고 마우스만 오는 경우**를 세는 곳: 펜을 `SendInput` 마우스로 내보내는
@@ -810,6 +852,30 @@ mod win32 {
         PROBES.with(|slots| {
             if let Some(slot) = slots.borrow().get(index) {
                 slot.mouse.set(slot.mouse.get().wrapping_add(1));
+            }
+        });
+    }
+
+    /// 이 포인터는 무엇인가 — `GetPointerType`의 계약 그대로(`PT_PEN`/`PT_TOUCH`/그 외는 마우스).
+    ///
+    /// 못 읽으면 **마우스로 본다**: 모르는 입력에 필기 자격을 주지 않는다.
+    fn pointer_kind(id: u32) -> Device {
+        let mut kind = POINTER_INPUT_TYPE::default();
+        match unsafe { GetPointerType(id, &mut kind) } {
+            Ok(()) if kind == PT_PEN => Device::Pen,
+            Ok(()) if kind == PT_TOUCH => Device::Touch,
+            _ => Device::Mouse,
+        }
+    }
+
+    /// **펜을 봤다** — 접촉과 무관한 사실이다(공중에 띄운 펜도 펜이다).
+    ///
+    /// 두 곳에 남긴다: 배지(`SEEN_PEN`)와 **어느 창으로 왔는가**(창마다 세면 훅 자리가 드러난다).
+    fn count_pen(index: usize) {
+        SEEN_PEN.set(true);
+        PROBES.with(|slots| {
+            if let Some(slot) = slots.borrow().get(index) {
+                slot.pen.set(slot.pen.get().wrapping_add(1));
             }
         });
     }
@@ -836,21 +902,11 @@ mod win32 {
     }
 
     /// pointer id 하나를 프레임으로 — **여기가 하드웨어와 모델의 경계**다.
-    fn record(index: usize, id: u32) {
-        let mut kind = POINTER_INPUT_TYPE::default();
-        let device = match unsafe { GetPointerType(id, &mut kind) } {
-            Ok(()) if kind == PT_PEN => Device::Pen,
-            Ok(()) if kind == PT_TOUCH => Device::Touch,
-            _ => Device::Mouse,
-        };
+    ///
+    /// 종류는 이미 읽혔다([`pointer_kind`] — 호버에서도 펜을 세려면 거기서 읽어야 한다).
+    /// 여기서는 **자세**만 읽는다.
+    fn record(id: u32, device: Device) {
         let (pressure, tilt, pose) = if device == Device::Pen {
-            SEEN_PEN.set(true);
-            // 진단: **어느 창으로 펜이 왔는가**(창마다 세면 훅 자리가 드러난다).
-            PROBES.with(|slots| {
-                if let Some(slot) = slots.borrow().get(index) {
-                    slot.pen.set(slot.pen.get().wrapping_add(1));
-                }
-            });
             pen_info(id)
         } else {
             (None, None, Pose::default())

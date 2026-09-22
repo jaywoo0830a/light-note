@@ -388,6 +388,8 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app
 | 화면 언어는 **영어만** | `ui_plan::every_visible_string_is_english_only` |
 | 진단 표가 **세 관문**을 정확히 말한다(펜 유무·창별 도착 수·훅 상태) | `digitizer::*` |
 | 펜을 **마우스로** 내보내는 드라이버를 그렇게 말한다(`WM_POINTER 0` + 마우스 수, 거짓 조언 없음) | `digitizer::a_pen_sent_as_mouse_is_reported_as_such` |
+| 펜은 **호버만 해도** 펜이다(접촉은 *프레임*의 자격이지 펜의 자격이 아니다) | `digitizer::hovering_pen_is_reported_as_a_pen_not_as_absent` |
+| 배지가 **왜** 잉크가 안 되는지 말한다(훅 미설치 / 비펜 포인터 / 마우스 / 무입력) | `digitizer::the_badge_says_why_input_is_not_ink` |
 | 원시 입력 장치 이름을 읽어 **어떤 드라이버인지** 보여준다 | `digitizer::the_pen_device_list_names_the_driver` |
 | 장치 경로 줄이기와 용도 이름(펜/터치는 다른 장치) | `digitizer::device_names_and_usages_are_readable` |
 | Win32 펜 값의 계약(압력 0~1024·틸트 ±90·회전 0~359) | `pipeline::stage1_win32_pen_values_keep_their_contract` |

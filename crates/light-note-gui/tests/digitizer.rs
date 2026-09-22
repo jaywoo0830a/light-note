@@ -5,7 +5,7 @@
 //! (`digitizer::Digest`는 값만 들고 있고, 문장은 `report`가 만든다 — 순수 함수다.)
 
 use light_note_gui::digitizer::{
-    compact_device_name, usage_label, Digest, Digitizer, HookState, PenDevice, Probe,
+    compact_device_name, input_badge, usage_label, Digest, Digitizer, HookState, PenDevice, Probe,
 };
 use light_note_gui::input::{Device, PointerFrame};
 
@@ -153,9 +153,67 @@ fn the_raw_input_query_answers_on_this_machine() {
     let digest = light_note_gui::digitizer::digest();
     let devices = row(&digest, "Windows pen devices");
     println!("Windows pen devices: {devices}");
+    // 이 기계가 진단 표에 **무엇이라고 답하는지** 전부 보여준다 — 표가 곧 사람이 읽는 문장이다.
+    for (name, value) in digest.report() {
+        println!("  {name}: {value}");
+    }
     assert!(!devices.is_empty(), "빈 칸이 아니라 문장이 나온다");
     // 창을 하나도 못 봤으면 마우스 카운터도 0이다(창 프로시저가 센 값이므로).
     assert_eq!(row(&digest, "Mouse messages"), "0");
+}
+
+#[test]
+fn hovering_pen_is_reported_as_a_pen_not_as_absent() {
+    // 접촉 전(호버)에도 펜은 **있다**. 프레임은 접촉의 것이지만, "펜을 봤는가"는 다른 사실이다 —
+    // 예전에는 호버만 하면 배지가 "no pen detected"라고 **거짓말**했다(접촉 여부를 먼저 봤다).
+    let hovering = Digest {
+        seen_pen: true,
+        last: None,
+        last_age_ms: None,
+        ..working()
+    };
+    assert!(
+        row(&hovering, "Pen frames").starts_with("yes"),
+        "호버도 펜이다"
+    );
+    assert!(
+        hovering
+            .report()
+            .iter()
+            .any(|(name, value)| name == "Hint" && value.contains("not in contact")),
+        "호버 중이라는 사실을 말한다(획이 없는 이유다)"
+    );
+    // 접촉하면 힌트가 사라진다 — 필요한 말만 한다.
+    assert!(!working()
+        .report()
+        .iter()
+        .any(|(_, value)| value.contains("not in contact")),);
+}
+
+#[test]
+fn the_badge_says_why_input_is_not_ink() {
+    // 배지는 사용자가 가장 먼저 읽는 문장이다 — "펜이 안 잡힌다"로 끝내지 않고 **왜**를 말한다.
+    let case = |state, seen_pen, messages, mouse| input_badge(state, seen_pen, messages, mouse);
+    assert_eq!(
+        case(HookState::Hooking, true, 42, 0),
+        "Pen — digitizer active"
+    );
+    assert_eq!(
+        case(HookState::Hooking, false, 42, 0),
+        "Pen only — pointer input is not a pen"
+    );
+    assert_eq!(
+        case(HookState::Hooking, false, 0, 512),
+        "Pen only — input arrives as mouse (check the tablet driver)"
+    );
+    assert_eq!(
+        case(HookState::Hooking, false, 0, 0),
+        "Pen only — no pen detected yet"
+    );
+    // 훅이 안 걸렸으면 그 **이유**가 문장이다(배지가 거짓으로 "펜 없음"을 말하지 않는다).
+    let unhooked = case(HookState::NoWindow, false, 0, 0);
+    assert!(unhooked.contains("window"), "{unhooked}");
+    assert!(!unhooked.contains("Pen only"), "{unhooked}");
 }
 
 #[test]
@@ -188,7 +246,7 @@ fn a_working_digitizer_reports_every_gate_as_open() {
 
 #[test]
 fn a_missing_pen_is_reported_first_with_a_hint() {
-    // 펜이 없는 기계: 첫 줄이 그 사실을 말하고, 힌트가 **결론**을 준다.
+    // 펜이 없는 기계: 첫 줄이 그 사실을 말하고, 힌트가 **주의**를 준다(결론이 아니다).
     let digest = Digest {
         digitizer: Digitizer::default(),
         seen_pen: false,
@@ -202,11 +260,14 @@ fn a_missing_pen_is_reported_first_with_a_hint() {
     };
     let rows = digest.report();
     assert_eq!(rows[0].0, "System digitizer", "첫 줄은 하드웨어다");
-    assert!(rows[0].1.starts_with("none reported"), "{:?}", rows[0]);
+    // 이 지표는 **내장** 기준이다 — 실측(이 개발 PC: `VID_28BD` 펜 장치가 있는데도 0)처럼
+    // USB·가상 펜에서 0이 나오므로 "펜이 없다"고 단정하지 않는다.
+    assert!(rows[0].1.starts_with("0 —"), "{:?}", rows[0]);
+    assert!(rows[0].1.contains("often report 0"), "{:?}", rows[0]);
     assert!(
         rows.iter()
-            .any(|(name, value)| name == "Hint" && value.contains("needs a pen digitizer")),
-        "펜이 없으면 힌트가 결론을 말한다"
+            .any(|(name, value)| name == "Hint" && value.contains("judge by the device list")),
+        "지표가 안 잡아도 **다른 근거**를 보라고 말한다"
     );
     assert_eq!(row(&digest, "Hook"), "no app window found — still looking");
     assert!(row(&digest, "Pen frames").contains("no pointer message"));

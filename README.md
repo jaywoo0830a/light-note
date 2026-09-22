@@ -23,6 +23,20 @@
   함께 보면 "펜이 안 잡히는" 이유가 두 갈래로 갈린다: **OS가 펜을 모른다**(장치 목록이 비었다) vs
   **펜을 마우스로 내보낸다**(`WM_POINTER 0` · `mouse N`, 아래 OTD 항목).
 
+- **입력 배지**: 상태 띠의 배지(`Pen — digitizer active`)는 **왜 잉크가 안 되는지**까지 말한다 —
+  `Pen only — pointer input is not a pen`(포인터는 오는데 펜이 아니다) · `input arrives as mouse`
+  (`WM_POINTER`가 하나도 없고 마우스만 온다 = 펜을 마우스로 내보내는 드라이버다) ·
+  `no pen detected yet`(아무 입력도 없다). 훅이 안 걸렸으면 `HookState`의 이유가 문장이다
+  (`digitizer::input_badge`, 순수 함수).
+- **호버도 "펜"이다**: 접촉 여부(`POINTER_FLAG_INCONTACT`)는 **프레임**의 자격이지 펜의 자격이
+  아니다 — 접촉 전 업데이트는 프레임을 만들지 않지만(호버가 마우스 드래그에 펜 자격을 붙이면
+  거짓), "펜을 봤다"는 사실은 그때도 참이다. 그 상태는 표가
+  `the pen is in range but not in contact — touch the surface to draw`라고 말한다.
+- **`SM_DIGITIZER`는 결론이 아니다**: 이 지표는 **내장** 디지타이저 기준이라 USB 펜·가상 펜에서
+  **0**으로 나온다(실측: 이 개발 PC에 `HID VID_28BD&PID_0947&MI_01 · pen` 장치가 등록돼 있는데도
+  `GetSystemMetrics(SM_DIGITIZER) == 0`). 그래서 표는 이 값으로 "펜이 없다"고 단정하지 않고
+  **장치 목록과 창별 카운터를 보라**고 말한다.
+
 ### OpenTabletDriver(OTD)와 함께 쓸 때
 
 OTD는 **출력 모드가 펜을 어떻게 내보내는지**를 정한다 — 그게 이 앱이 펜을 보는지도 정한다.
@@ -194,7 +208,7 @@ Border (루트: PDF 끌어놓기 — 공식 drag-drop 패턴)              app.r
 cargo test -p light-note-gui
 ```
 
-97개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
+99개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
 
 - `pipeline` — ①표본 정규화(표면 DIP → pt)·**펜 프레임**(장치·필압·틸트, 낡은 프레임은 버림)
   ②드래그 하나 = 편집 하나·취소는 흔적 없음·**펜만 필기**(마우스·손가락은 무시)·**필압이

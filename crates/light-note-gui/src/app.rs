@@ -391,16 +391,9 @@ impl Shell {
     /// 필기가 안 될 때 사용자가 원인을 알 수 있는 유일한 단서라서, 상태 문구(마지막으로
     /// 한 일)와 **따로** 둔다: 훅이 안 걸렸는지 / 펜이 아직 안 왔는지 / 펜이 오는지.
     fn input_badge(&self) -> String {
-        let state = digitizer::state();
-        if !state.is_hooking() {
-            // 훅 자체가 안 걸렸다 — 이유를 그대로 보여준다.
-            return state.reason().to_string();
-        }
-        if digitizer::seen_pen() {
-            "Pen — digitizer active".to_string()
-        } else {
-            "Pen only — no pen detected yet".to_string()
-        }
+        // 배지의 문장은 진단 표와 **같은 값**에서 나온다(두 곳이 다른 말을 하면 안 된다).
+        let digest = digitizer::digest();
+        digitizer::input_badge(digest.state, digest.seen_pen, digest.messages, digest.mouse)
     }
 
     // ── ② 명령 (elm 의도) ───────────────────────────────────────────
