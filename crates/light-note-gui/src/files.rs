@@ -35,21 +35,22 @@ impl OpenedFile {
 /// PDF 열기 대화상자 — **UI 스레드**에서 부른다. 취소하면 `None`.
 pub fn pick_pdf() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("PDF 열기")
-        .add_filter("PDF 문서", &["pdf"])
+        .set_title("Open PDF")
+        .add_filter("PDF document", &["pdf"])
         .pick_file()
 }
 
 /// 경로에서 바이트를 읽는다 — **백그라운드**에서 부른다.
 pub fn read_pdf(path: PathBuf) -> Result<OpenedFile, String> {
-    let bytes = std::fs::read(&path).map_err(|error| format!("파일을 읽지 못했습니다: {error}"))?;
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("Could not read the file: {error}"))?;
     Ok(OpenedFile { path, bytes })
 }
 
 /// 저장 경로를 묻는다 — **UI 스레드**에서 부른다.
 pub fn pick_save(extension: &str, filter: &str, suggested: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("저장")
+        .set_title("Save")
         .add_filter(filter, &[extension])
         .set_file_name(suggested)
         .save_file()

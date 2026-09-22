@@ -1,7 +1,8 @@
 //! 화면 계약 — elm 계획(plan)과 `<Raw>` 경계를 **헤드리스로** 검증한다.
 //!
-//! 화면은 플랫폼을 모르므로 여기서 잡히는 회귀는 WinUI에서도 그대로 회귀다(계획 → 컨트롤
-//! 번역은 기계적이다). 그리고 `<Raw>`가 유일한 WinUI 접점이라는 규칙도 여기서 못박는다.
+//! 화면은 플랫폼을 모르므로 여기서 잡히는 회귀는 WinUI에서도 그대로 회귀다. 버튼은 이제
+//! 조각(`<Raw>`)이 만들지만, **정의**(어떤 의도가 어디에 있는가)와 **통로**(의도가 호스트로
+//! 가는 길)는 플랫폼 무관이라 여기서 못박는다 — 그리는 일만 WinUI가 한다.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,33 +12,17 @@ use elm_magic_windows_reactor::{plan, Pass, PlanNode};
 
 use light_note_gui::geom::{Pt, Scale, Size};
 use light_note_gui::ink::{InkPoint, Stroke, Style, Tool};
+use light_note_gui::input::Device;
 use light_note_gui::shape::live_ink;
 use light_note_gui::ui::{
-    clear_frame, clear_surface_builder, page_label, set_surface_builder, stage_frame, Frame,
-    Intent, Screen, ScreenProps, Stage, SurfaceSlot, ViewModel,
+    clear_frame, clear_intent_sink, clear_part_builder, clear_surface_builder, clear_view,
+    page_label, set_intent_sink, set_part_builder, set_surface_builder, stage_frame, stage_view,
+    Frame, Header, HeaderProps, InkSurface, InkSurfaceProps, Intent, IntentSink, Part, Screen,
+    ScreenProps, Stage, SurfaceSlot, ViewModel,
 };
 
-/// 툴바 버튼 18개 — **라벨은 사용자가 읽는 문자열**이므로 테스트가 그대로 못박는다.
-const TOOLBAR: [(Intent, &str); 18] = [
-    (Intent::Pen, "펜"),
-    (Intent::Highlighter, "형광펜"),
-    (Intent::Eraser, "지우개"),
-    (Intent::Thinner, "가늘게"),
-    (Intent::Thicker, "굵게"),
-    (Intent::Undo, "되돌리기"),
-    (Intent::Redo, "다시하기"),
-    (Intent::Clear, "페이지 비우기"),
-    (Intent::Open, "PDF 열기"),
-    (Intent::ExportPng, "PNG 저장"),
-    (Intent::ExportPdf, "PDF 저장"),
-    (Intent::PageAdd, "페이지 추가"),
-    (Intent::PageRemove, "페이지 삭제"),
-    (Intent::PagePrev, "이전 페이지"),
-    (Intent::PageNext, "다음 페이지"),
-    (Intent::ZoomIn, "확대"),
-    (Intent::ZoomOut, "축소"),
-    (Intent::Retry, "다시 시도"),
-];
+/// 화면이 **항상** 갖는 조각 수 — 앱바 · 툴바 · 레일 · 상태바.
+const CHROME_RAW: usize = 4;
 
 /// 화면에 내려가는 값 하나 — 호스트가 진실을 소유하므로 테스트가 그 값을 정한다.
 fn view(tool: Tool, stage: Stage) -> ViewModel {
@@ -53,15 +38,18 @@ fn view(tool: Tool, stage: Stage) -> ViewModel {
         can_undo: false,
         can_redo: false,
         dirty: false,
-        title: "무제".to_string(),
+        title: "Untitled".to_string(),
         pdf_name: String::new(),
         stage,
-        status: "무제 · 1 / 1페이지 · 획 0개".to_string(),
+        status: "Untitled · page 1 / 1 · 0 strokes".to_string(),
+        input: "Pen — digitizer active".to_string(),
+        help: false,
+        viewport: (1280.0, 800.0),
         page_labels: vec![page_label(0, 0)],
     }
 }
 
-/// 의도를 기록하는 콜백 하나 — 화면에는 이것 하나만 있다.
+/// 의도를 기록하는 콜백 하나 — elm에서 올라오는 길(키보드·콜백 prop)의 계약이다.
 fn props(view: ViewModel, log: &Rc<RefCell<Vec<Intent>>>) -> ScreenProps {
     let log = Rc::clone(log);
     ScreenProps {
@@ -80,96 +68,170 @@ fn plan_of(view: ViewModel) -> (PlanNode, Pass) {
     plan(&tree)
 }
 
-#[test]
-fn the_toolbar_has_one_button_per_intent() {
-    let (node, pass) = plan_of(view(Tool::Pen, Stage::Ready));
-    assert_eq!(node.control(), "StackPanel");
-    assert_eq!(pass.count("Button"), 18, "의도 하나 = 버튼 하나");
-
-    for (intent, label) in TOOLBAR {
-        if intent == Intent::Retry {
-            assert!(
-                !pass.has_label(label),
-                "복구 버튼은 **실패 화면에만** 있다 — 평소 화면을 어지럽히지 않는다"
-            );
-            continue;
-        }
-        assert!(
-            pass.has_label(label),
-            "`{}` 버튼이 계획에 없다(의도 {intent:?})",
-            label
-        );
-    }
-    assert!(pass.has_label("단축키"), "안내 패널은 버튼으로도 열린다");
+/// "영어만"의 판정 — 알파벳은 ASCII뿐이어야 한다(`—`/`·`/`…` 같은 구두점은 자유다).
+fn is_english(text: &str) -> bool {
+    !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
 }
 
 #[test]
-fn every_button_reports_its_intent() {
+fn the_chrome_definition_covers_every_intent_once() {
+    // 버튼의 **정의**는 플랫폼 무관이다 — 툴바 + 레일 + 복구가 화면의 의도를 나눠 갖는다.
+    let flat: Vec<Intent> = Intent::TOOLBAR
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .chain(Intent::RAIL.iter().flat_map(|group| group.iter().copied()))
+        .chain([Intent::Retry])
+        .collect();
+    assert_eq!(
+        flat.len(),
+        Intent::CHROME.len(),
+        "정의(툴바+레일+복구)와 CHROME의 개수가 어긋난다"
+    );
+    for intent in Intent::CHROME {
+        assert_eq!(
+            flat.iter()
+                .filter(|candidate| **candidate == intent)
+                .count(),
+            1,
+            "{intent:?}가 화면 어딘가에 **정확히 한 번** 있어야 한다"
+        );
+    }
+
+    // 라벨은 서로 다르고 전부 영어다(툴팁·자동화 이름이 서로 구별돼야 한다).
+    let mut labels: Vec<&str> = Intent::CHROME.iter().map(|intent| intent.label()).collect();
+    for label in &labels {
+        assert!(is_english(label), "{label}");
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), Intent::CHROME.len(), "라벨이 중복이다");
+}
+
+#[test]
+fn every_visible_string_is_english_only() {
+    // 화면 언어 규칙: 사용자가 읽는 문자열은 **전부 영어**다(라벨·힌트·단계·장치).
+    for intent in Intent::CHROME {
+        assert!(is_english(intent.label()), "{}", intent.label());
+    }
+    assert!(is_english(Intent::CloseHelp.label()));
+    assert!(is_english(Intent::GoToPage(0).label()));
+    for tool in Tool::ALL {
+        assert!(is_english(tool.label()), "{}", tool.label());
+        assert!(is_english(Style::hint(tool)), "{}", Style::hint(tool));
+    }
+    for stage in [
+        Stage::Empty,
+        Stage::Loading,
+        Stage::Ready,
+        Stage::Failed("Failed".to_string()),
+    ] {
+        assert!(is_english(&stage.message()), "{}", stage.message());
+    }
+    assert!(is_english(&page_label(0, 4)), "{}", page_label(0, 4));
+    for device in [Device::Pen, Device::Touch, Device::Mouse] {
+        assert!(is_english(device.label()), "{}", device.label());
+    }
+}
+
+#[test]
+fn the_screen_is_chrome_plus_ink() {
+    // 조각의 **순서**가 곧 화면 순서다: 앱바 → 툴바 → 정보 띠 → 본문(레일 + 잉크).
+    // 정보 띠가 본문 **위**에 있는 것은 의도다: 아래에 두면 잉크 영역 높이 추정이 틀릴 때
+    // 화면 밖으로 밀린다.
+    let (node, _) = plan_of(view(Tool::Pen, Stage::Ready));
+    let kinds: Vec<&str> = node.children.iter().map(|child| child.control()).collect();
+    assert_eq!(
+        kinds,
+        vec!["Raw", "Raw", "Raw", "StackPanel"],
+        "앱바 · 툴바 · 정보 띠(조각) · 본문(레일 조각 + 잉크 조각)"
+    );
+}
+
+#[test]
+fn no_elm_buttons_remain() {
+    // 버튼은 전부 조각이 만든다: elm 계획에는 버튼이 **하나도** 없어야 한다.
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
+    assert_eq!(pass.count("Button"), 0, "elm 기본 버튼을 쓰지 않는다");
+    assert_eq!(pass.count("TextBlock"), 0, "글자도 조각이 만든다");
+}
+
+#[test]
+fn the_stage_decides_which_parts_appear() {
+    // 준비됨: 조각 넷 + 잉크 표면.
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "잉크 표면은 언제나 하나");
+
+    // 빈 페이지: 표면은 그대로 있고 **안내는 표면 안**에 있다(잉크 영역 높이가 단계마다
+    // 달라지면 크롬이 화면 밖으로 밀린다 — `render::surface`가 안내를 스크롤 안에 둔다).
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Empty));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "빈 상태도 표면 하나");
+
+    // 여는 중: 표면 대신 스피너(아직 문서가 없다).
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Loading));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "표면 없이 진행 상황만");
+
+    // 실패: 표면 대신 이유 + 복구 동선.
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Failed("Encrypted PDF".to_string())));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "표면 없이 복구 동선만");
+}
+
+#[test]
+fn the_shortcut_panel_follows_the_host_flag() {
+    // 열림 상태는 **호스트가 소유**한다(`view.help`) — elm은 자리만 정한다.
+    let mut open = view(Tool::Pen, Stage::Ready);
+    open.help = true;
+    let (_, pass) = plan_of(open);
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 2, "단축키 패널이 더 있다");
+
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "닫혀 있으면 자리도 없다");
+}
+
+#[test]
+fn the_f1_and_escape_keys_send_intents() {
+    // elm은 상태를 소유하지 않는다 — 키는 **의도로 바뀌어** 호스트로 간다.
     let log = Rc::new(RefCell::new(Vec::new()));
     let mut app = elm_magic::mount_with::<Screen>(props(view(Tool::Pen, Stage::Ready), &log));
 
-    // 실패 화면 전용 버튼을 뺀 나머지를 차례로 누른다.
-    for (intent, label) in TOOLBAR {
-        if intent == Intent::Retry {
-            continue;
-        }
-        app.click(label);
-    }
-
-    let expected: Vec<Intent> = TOOLBAR
-        .iter()
-        .filter(|(intent, _)| *intent != Intent::Retry)
-        .map(|(intent, _)| *intent)
-        .collect();
+    app.press_key("F1");
+    app.press_key("Escape");
     assert_eq!(
         log.borrow().as_slice(),
-        expected.as_slice(),
-        "버튼 → 의도 매핑이 정확해야 한다"
+        [Intent::ToggleHelp, Intent::CloseHelp],
+        "F1 = 토글, Esc = 닫기"
     );
 }
 
-#[test]
-fn retry_is_reachable_where_the_failure_is_shown() {
-    let log = Rc::new(RefCell::new(Vec::new()));
-    let failed = view(Tool::Pen, Stage::Failed("암호화된 PDF".to_string()));
-    let mut app = elm_magic::mount_with::<Screen>(props(failed, &log));
+thread_local! {
+    /// 조각 빌더가 받은 것 — 헤드리스에서는 WinUI 뷰를 만들 수 없으므로 **받은 것**을 기록한다.
+    static SEEN_PART: RefCell<Option<(Part, ViewModel, IntentSink)>> = const { RefCell::new(None) };
+    /// 표면 빌더가 받은 재료(프레임 + 값).
+    static SEEN_FRAME: RefCell<Option<(Frame, ViewModel)>> = const { RefCell::new(None) };
+}
 
-    app.click("다시 시도");
-    assert_eq!(log.borrow().as_slice(), [Intent::Retry]);
+/// 조각 빌더 대역 — 창이 있어야 뷰를 만들 수 있으므로 `None`을 돌려준다.
+fn recording_part_builder(part: Part, view: &ViewModel, sink: &IntentSink) -> SurfaceSlot {
+    SEEN_PART.with(|slot| *slot.borrow_mut() = Some((part, view.clone(), Rc::clone(sink))));
+    None
+}
+
+/// 표면 빌더 대역 — 같은 이유로 `None`.
+fn recording_builder(frame: &Frame, view: &ViewModel) -> SurfaceSlot {
+    SEEN_FRAME.with(|slot| *slot.borrow_mut() = Some((frame.clone(), view.clone())));
+    None
 }
 
 #[test]
-fn the_stage_decides_what_the_surface_area_shows() {
-    // 빈 페이지: 안내 + 표면. 표면이 없으면 그릴 수가 없다.
-    let (_, pass) = plan_of(view(Tool::Pen, Stage::Empty));
-    assert!(
-        pass.has_text("여기에 필기하세요 — 펜으로 그리면 됩니다"),
-        "빈 상태는 무엇을 하면 되는지 말한다"
-    );
-    assert_eq!(pass.count("Raw"), 1, "빈 페이지에도 표면은 있어야 한다");
+fn the_chrome_values_and_intent_sink_reach_the_parts() {
+    // 조각은 **화면이 받은 값 그대로**와, 버튼이 쓸 **의도 통로**를 함께 받는다.
+    clear_view();
+    clear_part_builder();
+    clear_intent_sink();
+    set_part_builder(Rc::new(recording_part_builder));
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&sent);
+    set_intent_sink(Rc::new(move |intent: Intent| log.borrow_mut().push(intent)));
 
-    // 준비됨: 안내는 사라지고 표면만 남는다.
-    let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
-    assert!(!pass.has_text("여기에 필기하세요 — 펜으로 그리면 됩니다"));
-    assert_eq!(pass.count("Raw"), 1);
-
-    // 여는 중: 표면을 만들지 않는다(아직 문서가 없다).
-    let (_, pass) = plan_of(view(Tool::Pen, Stage::Loading));
-    assert!(pass.has_text("PDF 여는 중…"));
-    assert_eq!(pass.count("Raw"), 0, "여는 중에는 표면을 만들지 않는다");
-
-    // 실패: 이유 + 같은 자리에 복구 동선.
-    let (_, pass) = plan_of(view(Tool::Pen, Stage::Failed("암호화된 PDF".to_string())));
-    assert!(
-        pass.has_text("암호화된 PDF"),
-        "이유를 보여줘야 복구할 수 있다"
-    );
-    assert!(pass.has_label("다시 시도"));
-    assert_eq!(pass.count("Raw"), 0, "실패했으면 표면도 없다");
-}
-
-#[test]
-fn the_status_bar_reflects_tool_zoom_and_flags() {
     let mut status = view(Tool::Highlighter, Stage::Ready);
     status.zoom = 150.0;
     status.width_pt = 14.0;
@@ -178,67 +240,46 @@ fn the_status_bar_reflects_tool_zoom_and_flags() {
     status.live_shapes = 5;
     status.can_undo = true;
     status.dirty = true;
+    status.page = 1;
+    status.page_count = 2;
+    status.page_labels = vec![page_label(0, 4), page_label(1, 0)];
+    stage_view(status.clone());
 
-    let (_, pass) = plan_of(status);
-    assert!(pass.has_text("도구: 형광펜"));
-    assert!(pass.has_text("굵기 14.0pt"));
-    assert!(pass.has_text("배율 150%"));
-    assert!(pass.has_text("획 3개"));
-    assert!(
-        pass.has_text("베이스 2획 · 라이브 5도형"),
-        "파이프라인 상태가 한 줄로 보인다"
-    );
-    assert!(pass.has_text("되돌릴 수 있음"));
-    assert!(pass.has_text("저장 안 됨"));
-    assert!(
-        !pass.has_text("다시할 수 없음"),
-        "다시하기가 없으면 표시도 없다"
-    );
-    assert!(pass.has_text(Style::hint(Tool::Highlighter)));
-}
+    let mut ctx = Ctx::new();
+    let tree = elm_magic::frame::<Header>(&mut ctx, &HeaderProps::default());
+    let mut slot: SurfaceSlot = None;
+    elm_magic::raw::invoke(&tree, &mut slot);
+    assert!(slot.is_none(), "헤드리스에서는 WinUI 뷰를 만들 수 없다");
 
-#[test]
-fn the_sidebar_lists_every_page() {
-    let mut view = view(Tool::Pen, Stage::Ready);
-    view.page = 1;
-    view.page_count = 2;
-    view.page_labels = vec![page_label(0, 4), page_label(1, 0)];
+    let (part, seen, sink) = SEEN_PART
+        .with(|slot| slot.borrow().clone())
+        .expect("조각 빌더가 받은 것");
+    assert_eq!(part, Part::Header);
+    assert_eq!(seen, status, "조각은 화면이 받은 값 그대로를 본다");
 
-    let (_, pass) = plan_of(view);
-    assert!(pass.has_text("페이지 2 / 2"));
-    assert!(pass.has_text("1페이지 · 획 4개"));
-    assert!(pass.has_text("2페이지 · 획 0개"));
-}
+    // 조각들이 화면에 쓰는 문구 — 값에서 나오고, 전부 영어다.
+    assert_eq!(seen.tool_label(), "Highlighter");
+    assert_eq!(seen.zoom_label(), "150%");
+    assert_eq!(seen.pipeline_label(), "Base 2 strokes · live 5 shapes");
+    assert_eq!(seen.hint(), Style::hint(Tool::Highlighter));
+    assert_eq!(seen.page_labels[1], "Page 2 · 0 strokes");
+    assert!(is_english(&seen.status), "{}", seen.status);
+    assert!(is_english(&seen.input), "{}", seen.input);
 
-#[test]
-fn the_shortcut_panel_opens_with_f1_and_closes_with_escape() {
-    let mut app = elm_magic::mount_with::<Screen>(props(
-        view(Tool::Pen, Stage::Ready),
-        &Rc::new(RefCell::new(Vec::new())),
-    ));
-    assert!(!app.text().contains("F1 안내 열기/닫기"));
+    // **버튼이 쓸 통로**: 통로로 보낸 의도가 호스트 대역에 그대로 도착한다.
+    sink(Intent::Pen);
+    sink(Intent::Undo);
+    assert_eq!(sent.borrow().as_slice(), [Intent::Pen, Intent::Undo]);
 
-    app.press_key("F1");
-    assert!(app.text().contains("F1 안내 열기/닫기"), "F1로 열린다");
-    app.press_key("Escape");
-    assert!(!app.text().contains("F1 안내 열기/닫기"), "Esc로 닫힌다");
+    // 값이 없으면 조각도 그리지 않는다 — 거짓 그림을 만들지 않는다.
+    clear_view();
+    SEEN_PART.with(|slot| *slot.borrow_mut() = None);
+    let mut empty: SurfaceSlot = None;
+    elm_magic::raw::invoke(&tree, &mut empty);
+    assert!(SEEN_PART.with(|slot| slot.borrow().is_none()));
 
-    // 같은 패널을 **버튼으로도** 열 수 있다(키 라우팅이 제한적인 어댑터의 우회로).
-    app.click("단축키");
-    assert!(app.text().contains("F1 안내 열기/닫기"));
-    app.click("단축키");
-    assert!(!app.text().contains("F1 안내 열기/닫기"));
-}
-
-thread_local! {
-    /// 빌더가 받은 재료 — 호스트 대역(표면 빌더는 UI 스레드에서만 돈다).
-    static SEEN: RefCell<Option<Frame>> = const { RefCell::new(None) };
-}
-
-/// 표면 빌더 대역 — WinUI 뷰는 창이 있어야 만들 수 있으므로 `None`을 돌려준다.
-fn recording_builder(frame: &Frame) -> SurfaceSlot {
-    SEEN.with(|slot| *slot.borrow_mut() = Some(frame.clone()));
-    None
+    clear_part_builder();
+    clear_intent_sink();
 }
 
 #[test]
@@ -263,15 +304,12 @@ fn the_surface_reaches_the_registered_builder_through_one_raw_slot() {
         ..Default::default()
     };
     stage_frame(frame.clone());
+    // 표면은 값도 받는다(잉크 영역 높이·빈 상태 안내) — 호스트의 `stage_view`와 같다.
+    stage_view(view(Tool::Pen, Stage::Ready));
 
+    // 잉크 표면만 계획한다 — 조각(앱바/툴바/…)과 섞이지 않게 **컴포넌트 하나**로 본다.
     let mut ctx = Ctx::new();
-    let tree = elm_magic::frame::<Screen>(
-        &mut ctx,
-        &props(
-            view(Tool::Pen, Stage::Ready),
-            &Rc::new(RefCell::new(Vec::new())),
-        ),
-    );
+    let tree = elm_magic::frame::<InkSurface>(&mut ctx, &InkSurfaceProps::default());
     let (_, pass) = plan(&tree);
     assert_eq!(pass.count("Raw"), 1, "표면은 <Raw> **하나**로만 붙는다");
 
@@ -281,7 +319,7 @@ fn the_surface_reaches_the_registered_builder_through_one_raw_slot() {
     // 헤드리스에서는 채울 수 없다. 그래서 **빌더가 불렸다**는 사실을 받은 재료로 확인한다.
     assert!(slot.is_none(), "헤드리스에서는 WinUI 뷰를 만들 수 없다");
 
-    let seen = SEEN
+    let (seen, view) = SEEN_FRAME
         .with(|slot| slot.borrow().clone())
         .expect("빌더가 받은 재료");
     assert_eq!(seen.size, frame.size);
@@ -289,27 +327,30 @@ fn the_surface_reaches_the_registered_builder_through_one_raw_slot() {
     assert_eq!(seen.baked, frame.baked);
     assert_eq!(seen.strokes, frame.strokes);
     assert_eq!(seen.tail.len(), frame.tail.len(), "꼬리 도형이 그대로 간다");
+    // 값도 함께 간다: 잉크 영역의 높이와 빈 상태 안내가 표면 안에서 필요하다.
+    assert_eq!(view.viewport, (1280.0, 800.0), "창 크기가 표면까지 온다");
 
     // 재료는 **프레임당 유지**된다 — 같은 발행이 여러 번 그려도 같은 것을 본다.
-    SEEN.with(|slot| *slot.borrow_mut() = None);
+    SEEN_FRAME.with(|slot| *slot.borrow_mut() = None);
     let mut again: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut again);
     assert!(
-        SEEN.with(|slot| slot.borrow().is_some()),
+        SEEN_FRAME.with(|slot| slot.borrow().is_some()),
         "재료는 소비되지 않는다"
     );
 
     // 발행이 끝나면 비운다 — 다음 프레임이 옛 재료로 그려지면 안 된다.
     clear_frame();
-    SEEN.with(|slot| *slot.borrow_mut() = None);
+    SEEN_FRAME.with(|slot| *slot.borrow_mut() = None);
     let mut empty: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut empty);
     assert!(
-        SEEN.with(|slot| slot.borrow().is_none()),
+        SEEN_FRAME.with(|slot| slot.borrow().is_none()),
         "재료가 없으면 빌더도 불리지 않는다"
     );
 
     clear_surface_builder();
+    clear_view();
 }
 
 #[test]
@@ -320,13 +361,7 @@ fn a_surface_without_a_builder_leaves_the_slot_empty() {
     stage_frame(Frame::default());
 
     let mut ctx = Ctx::new();
-    let tree = elm_magic::frame::<Screen>(
-        &mut ctx,
-        &props(
-            view(Tool::Pen, Stage::Ready),
-            &Rc::new(RefCell::new(Vec::new())),
-        ),
-    );
+    let tree = elm_magic::frame::<InkSurface>(&mut ctx, &InkSurfaceProps::default());
     let mut slot: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut slot);
     assert!(slot.is_none());

@@ -61,8 +61,10 @@ impl HookState {
     pub const fn reason(self) -> &'static str {
         match self {
             HookState::Hooking => "",
-            HookState::Idle | HookState::NoWindow => "앱 창을 찾지 못해 펜 입력을 읽을 수 없습니다",
-            HookState::Failed => "창 서브클래스 설치가 거부됐습니다 — 펜 입력을 읽을 수 없습니다",
+            HookState::Idle | HookState::NoWindow => {
+                "App window not found — pen input cannot be read"
+            }
+            HookState::Failed => "Window subclass install was refused — pen input cannot be read",
         }
     }
 }

@@ -32,7 +32,10 @@ use std::rc::Rc;
 
 use elm_magic::Callback;
 use elm_magic_windows_reactor::{ElmInput, ElmView};
-use windows_reactor::{Component, ComponentContext, View, ViewContext};
+use windows_reactor::{
+    ChildrenControl, Component, ComponentContext, Grid, View, ViewContext, WindowBackdrop,
+    WindowSize, WindowTheme, WindowVisuals,
+};
 
 use crate::canvas::{BakeResult, Canvas};
 use crate::digitizer;
@@ -41,6 +44,7 @@ use crate::files::{self, OpenedFile};
 use crate::geom::Size;
 use crate::ink::Tool;
 use crate::input::{self, Phase};
+use crate::parts;
 use crate::pdf::PdfDocument;
 use crate::render;
 use crate::tool::CanvasTool;
@@ -57,6 +61,8 @@ pub enum HostMessage {
     Baked(BakeResult),
     /// 화면 밖 그림의 디코드 완료(`ImageOpened`) — 앞자리로 올려도 좋다.
     Decoded(usize),
+    /// 창 크기가 바뀌었다 (DIP) — 잉크 영역의 높이를 다시 잡는다.
+    Resized(f64, f64),
     /// 백그라운드가 읽은 PDF 파일.
     Opened(Result<OpenedFile, String>),
     /// 백그라운드 내보내기 결과(저장된 경로).
@@ -75,6 +81,10 @@ pub struct Shell {
     pdf_bytes: Option<Vec<u8>>,
     stage: Stage,
     status: String,
+    /// 단축키 패널이 열려 있는가 — **호스트가 소유**한다(조각이 그리기만 한다).
+    help: bool,
+    /// 창의 클라이언트 크기 (DIP) — 잉크 영역 높이의 근거(관측이 오기 전에는 기본값).
+    viewport: (f64, f64),
     /// ④-워커에 가 있는 요청 id — **R2: 한 번에 하나**([`Canvas::needs_bake`]).
     baking: Option<u64>,
 }
@@ -90,7 +100,9 @@ impl Component for Shell {
             pdf: None,
             pdf_bytes: None,
             stage: Stage::Empty,
-            status: "새 노트 — 펜(디지타이저)으로 그려 보세요".to_string(),
+            status: "New note — draw with a pen (digitizer)".to_string(),
+            help: false,
+            viewport: (1280.0, 800.0),
             baking: None,
         };
         shell.refresh(context);
@@ -108,12 +120,16 @@ impl Component for Shell {
                 // 화면 밖 그림이 준비됐다 — 좌표만 맞바꾼다(디코드 없음).
                 self.canvas.promote();
             }
+            HostMessage::Resized(width, height) => {
+                // 창 크기가 바뀌었다 — 잉크 영역의 높이만 다시 잡는다(다음 발행에서).
+                self.viewport = (width, height);
+            }
             HostMessage::Opened(Ok(file)) => self.adopt_pdf(file),
             HostMessage::Opened(Err(error)) => {
                 self.status = error.clone();
                 self.stage = Stage::Failed(error);
             }
-            HostMessage::Exported(Ok(path)) => self.status = format!("저장: {}", path.display()),
+            HostMessage::Exported(Ok(path)) => self.status = format!("Saved: {}", path.display()),
             HostMessage::Exported(Err(error)) => {
                 self.status = error.clone();
                 self.stage = Stage::Failed(error);
@@ -130,7 +146,21 @@ impl Component for Shell {
         // 창 제목은 호스트가 정한다(elm은 플랫폼을 모른다 — 예제 20).
         context.window_title(format!("light-note — {}", self.canvas.doc().title()));
 
+        // **창 자체의 스타일**(예제 21): 테마는 시스템을 따르고 배경은 Mica.
+        // 창은 호스트만 만질 수 있다 — elm에는 창이라는 개념이 없다(어댑터가 옮기지 않는다).
+        context.window_visuals(
+            WindowVisuals::new()
+                .theme(WindowTheme::System)
+                .backdrop(WindowBackdrop::Mica),
+        );
+
+        // **창 크기 관측** — 잉크 영역이 창 안에 들어오게 하는 근거다(elm 트리는 StackPanel뿐이라
+        // 자식 높이가 묶이지 않는다). 관측은 큐로 오므로 다음 발행에서 반영된다.
         let sender = context.sender();
+        let resize_sender = sender.clone();
+        context.on_window_size(move |size: WindowSize| {
+            let _ = resize_sender.send(HostMessage::Resized(size.width, size.height));
+        });
 
         // ① 포인터 → 메시지 큐. 표면 빌더가 이 싱크를 **캡처**한다(예제 08).
         let pointer_sender = sender.clone();
@@ -146,17 +176,30 @@ impl Component for Shell {
             let _ = decoded_sender.send(HostMessage::Decoded(index));
         });
 
-        // 가속기(Reactor가 지원하는 키만) → 같은 큐.
+        // 가속기(Reactor가 지원하는 키만) → 같은 큐. **루트**에 붙인다(아래): 툴바 버튼을
+        // 누르면 포커스가 표면 밖으로 가므로, 표면에만 붙이면 그때 Ctrl+±가 죽는다.
         let accelerator_sender = sender.clone();
         let accelerators = render::accelerators(move |intent| {
             let _ = accelerator_sender.send(HostMessage::Intent(intent));
         });
-        ui::set_surface_builder(Rc::new(move |frame: &Frame| {
-            render::surface(frame, &sink, &decoded, accelerators.clone())
+        ui::set_surface_builder(Rc::new(move |frame: &Frame, view: &ViewModel| {
+            render::surface(frame, &sink, &decoded, view)
+        }));
+
+        // 조각 빌더 — `<Raw>` 슬롯(앱바/툴바/레일/상태바/안내/단축키)이 같은 함수를 부른다.
+        // 조각의 생김새는 `parts`에만 있으므로, 스타일을 바꿔도 이 파일은 그대로다.
+        ui::set_part_builder(Rc::new(parts::build));
+
+        // **의도 통로** — 조각이 만든 버튼이 여기로 의도를 보낸다. elm 콜백과 같은 큐다.
+        let part_sender = sender.clone();
+        ui::set_intent_sink(Rc::new(move |intent: Intent| {
+            let _ = part_sender.send(HostMessage::Intent(intent));
         }));
 
         // 발행 직전에 ④-UI 재료를 넣는다 — `<Raw>`가 꺼내 간다(슬롯을 못 보므로).
+        let view = self.view_model();
         ui::stage_frame(self.canvas.frame());
+        ui::stage_view(view.clone());
 
         // elm → 호스트: 의도 **하나**로 온다(예제 11의 콜백 prop).
         let intent_sender = sender.clone();
@@ -164,11 +207,16 @@ impl Component for Shell {
             let _ = intent_sender.send(HostMessage::Intent(intent));
         });
 
-        View::component::<ElmView<Screen>>(ElmInput::new(ScreenProps {
-            view: Some(self.view_model()),
+        let screen = View::component::<ElmView<Screen>>(ElmInput::new(ScreenProps {
+            view: Some(view),
             on_intent: Some(on_intent),
             ..Default::default()
-        }))
+        }));
+
+        // 가속기의 자리는 **창 전체를 담는 루트**다(예제 27: 껍데기는 호스트, 자리는 elm).
+        Grid::new()
+            .key_accelerators(accelerators)
+            .children((screen,))
     }
 }
 
@@ -210,19 +258,20 @@ impl Shell {
             Phase::Released => match self.tool.lift(self.canvas.doc_mut()) {
                 // 획 하나가 늘었다 — **접두사는 그대로 쓸 수 있다**(그 획은 꼬리가 그린다).
                 Some(crate::doc::Edit::AddStroke { .. }) => {
-                    self.status = "획을 추가했습니다".to_string();
+                    self.status = "Stroke added".to_string();
                 }
                 // 지운 결과는 접두사에 반영돼야 한다 — 다시 굽는다.
                 Some(edit) => {
                     self.canvas.invalidate();
-                    self.status = format!("{} — {}개", edit.label(), edit.affected_strokes());
+                    self.status =
+                        format!("{} — {} stroke(s)", edit.label(), edit.affected_strokes());
                 }
                 None => {}
             },
             Phase::Canceled => {
                 // 진행 중 획은 어디에도 남지 않고, 지운 것은 되돌아온다 → 접두사는 그대로 옳다.
                 if self.tool.cancel(self.canvas.doc_mut()) {
-                    self.status = "획을 취소했습니다".to_string();
+                    self.status = "Stroke canceled".to_string();
                 }
             }
         }
@@ -241,12 +290,12 @@ impl Shell {
             state.reason().to_string()
         } else if digitizer::seen_pen() {
             format!(
-                "{} 입력 — 이 앱은 펜(디지타이저)으로만 필기합니다",
+                "{} input — this app only inks with a pen (digitizer)",
                 sample.device().label()
             )
         } else {
             format!(
-                "{} 입력 — 펜(디지타이저)으로만 필기합니다. 아직 펜이 감지되지 않았습니다",
+                "{} input — this app only inks with a pen (digitizer), and no pen has been detected yet",
                 sample.device().label()
             )
         };
@@ -255,9 +304,26 @@ impl Shell {
     /// 펜으로 시작한 획의 한 줄 — **필압이 오는지**를 화면에서 확인할 수 있게.
     fn pen_status(sample: input::Sample) -> String {
         match (sample.pressure(), sample.tilt()) {
-            (Some(_), Some(_)) => "펜 — 필압·틸트 사용 중".to_string(),
-            (Some(_), None) => "펜 — 필압 사용 중 (틸트 미지원)".to_string(),
-            _ => "펜 — 필압을 보고하지 않는 장치 (속도로 굵기)".to_string(),
+            (Some(_), Some(_)) => "Pen — pressure and tilt".to_string(),
+            (Some(_), None) => "Pen — pressure (no tilt)".to_string(),
+            _ => "Pen — no pressure reported (width from speed)".to_string(),
+        }
+    }
+
+    /// 입력 배지 — "무엇으로 그리는 중인가"를 머리글에 **항상** 띄운다.
+    ///
+    /// 필기가 안 될 때 사용자가 원인을 알 수 있는 유일한 단서라서, 상태 문구(마지막으로
+    /// 한 일)와 **따로** 둔다: 훅이 안 걸렸는지 / 펜이 아직 안 왔는지 / 펜이 오는지.
+    fn input_badge(&self) -> String {
+        let state = digitizer::state();
+        if !state.is_hooking() {
+            // 훅 자체가 안 걸렸다 — 이유를 그대로 보여준다.
+            return state.reason().to_string();
+        }
+        if digitizer::seen_pen() {
+            "Pen — digitizer active".to_string()
+        } else {
+            "Pen only — no pen detected yet".to_string()
         }
     }
 
@@ -281,23 +347,23 @@ impl Shell {
             Intent::Undo => {
                 let edit = self.canvas.edit(|doc| doc.undo());
                 self.status = match edit {
-                    Some(edit) => format!("{} — 되돌렸습니다", edit.label()),
-                    None => "되돌릴 편집이 없습니다".to_string(),
+                    Some(edit) => format!("Undo — {}", edit.label()),
+                    None => "Nothing to undo".to_string(),
                 };
             }
             Intent::Redo => {
                 let edit = self.canvas.edit(|doc| doc.redo());
                 self.status = match edit {
-                    Some(edit) => format!("{} — 다시 적용", edit.label()),
-                    None => "다시 적용할 편집이 없습니다".to_string(),
+                    Some(edit) => format!("Redo — {}", edit.label()),
+                    None => "Nothing to redo".to_string(),
                 };
             }
             Intent::Clear => {
                 let cleared = self.canvas.edit(|doc| doc.clear_active_page());
                 self.status = if cleared {
-                    "페이지를 비웠습니다 (되돌리기 가능)".to_string()
+                    "Page cleared (undoable)".to_string()
                 } else {
-                    "비울 획이 없습니다".to_string()
+                    "Nothing to clear".to_string()
                 };
             }
             Intent::Open => self.open_pdf(context),
@@ -316,16 +382,24 @@ impl Shell {
                 self.status = if removed {
                     self.canvas.doc().status_line()
                 } else {
-                    "마지막 페이지는 지울 수 없습니다".to_string()
+                    "The last page cannot be removed".to_string()
                 };
             }
             Intent::PagePrev => self.step_page(-1),
             Intent::PageNext => self.step_page(1),
             Intent::ZoomIn => self.step_zoom(true),
             Intent::ZoomOut => self.step_zoom(false),
+            Intent::ToggleHelp => self.help = !self.help,
+            Intent::CloseHelp => self.help = false,
+            Intent::GoToPage(index) => {
+                // 레일에서 고른 페이지 — 페이지 이동은 접두사를 무효로 만든다(③이 안다).
+                if self.canvas.go_to_page(index) {
+                    self.status = self.canvas.doc().status_line();
+                }
+            }
             Intent::Retry => {
                 self.stage = Stage::Empty;
-                self.status = "다시 시작합니다".to_string();
+                self.status = "Starting over".to_string();
             }
         }
     }
@@ -336,7 +410,7 @@ impl Shell {
     }
 
     fn width_status(&self) -> String {
-        format!("굵기 {:.1}pt", self.tool.state().width_pt)
+        format!("Width {:.1} pt", self.tool.state().width_pt)
     }
 
     fn step_page(&mut self, delta: isize) {
@@ -348,7 +422,7 @@ impl Shell {
 
     fn step_zoom(&mut self, closer: bool) {
         if self.canvas.step_zoom(closer) {
-            self.status = format!("배율 {:.0}%", self.canvas.zoom());
+            self.status = format!("Zoom {:.0}%", self.canvas.zoom());
         }
     }
 
@@ -404,6 +478,9 @@ impl Shell {
                 .unwrap_or_default(),
             stage: self.stage.clone(),
             status: self.status.clone(),
+            input: self.input_badge(),
+            help: self.help,
+            viewport: self.viewport,
             page_labels: doc
                 .pages()
                 .iter()
@@ -419,24 +496,24 @@ impl Shell {
     /// PDF 열기 — 대화상자(UI 스레드) → 읽기(워커) → 파싱(지연 파싱이라 싸다).
     fn open_pdf(&mut self, context: &ComponentContext<Self>) {
         let Some(path) = files::pick_pdf() else {
-            self.status = "열기를 취소했습니다".to_string();
+            self.status = "Open canceled".to_string();
             return;
         };
         self.stage = Stage::Loading;
-        self.status = format!("{} 여는 중…", path.display());
+        self.status = format!("Opening {}…", path.display());
         let _ = context.spawn_background(move |_cancel| HostMessage::Opened(files::read_pdf(path)));
     }
 
     /// PNG 내보내기 — 페이지마다 파일 하나. 렌더는 워커에서.
     fn export_png(&mut self, context: &ComponentContext<Self>) {
-        let Some(directory) = files::pick_folder("PNG 저장 폴더") else {
-            self.status = "저장을 취소했습니다".to_string();
+        let Some(directory) = files::pick_folder("Choose a folder for the PNG export") else {
+            self.status = "Save canceled".to_string();
             return;
         };
         let doc = self.canvas.doc().clone();
         let pdf_bytes = self.pdf_bytes.clone();
         let stem = self.export_stem();
-        self.status = "PNG 내보내는 중…".to_string();
+        self.status = "Exporting PNG…".to_string();
         let _ = context.spawn_background(move |_cancel| {
             // 배경 PDF는 **여기서** 다시 파싱한다(문서는 스레드 경계를 넘기지 않는다).
             let source = pdf_bytes.and_then(|bytes| PdfDocument::from_bytes(bytes).ok());
@@ -451,13 +528,13 @@ impl Shell {
     /// PDF 내보내기 — 잉크는 벡터, 배경 페이지는 이미지 XObject.
     fn export_pdf(&mut self, context: &ComponentContext<Self>) {
         let suggested = format!("{}.pdf", self.export_stem());
-        let Some(path) = files::pick_save("pdf", "PDF 문서", &suggested) else {
-            self.status = "저장을 취소했습니다".to_string();
+        let Some(path) = files::pick_save("pdf", "PDF document", &suggested) else {
+            self.status = "Save canceled".to_string();
             return;
         };
         let doc = self.canvas.doc().clone();
         let pdf_bytes = self.pdf_bytes.clone();
-        self.status = "PDF 내보내는 중…".to_string();
+        self.status = "Exporting PDF…".to_string();
         let _ = context.spawn_background(move |_cancel| {
             let source = pdf_bytes.and_then(|bytes| PdfDocument::from_bytes(bytes).ok());
             let result =
@@ -488,7 +565,7 @@ impl Shell {
                 let zoom = self.canvas.zoom();
                 self.canvas = Canvas::from_pdf(sizes, stem, zoom);
                 self.stage = Stage::Ready;
-                self.status = format!("{name} — {count}페이지");
+                self.status = format!("{name} — {count} page(s)");
                 self.pdf = Some(pdf);
                 self.pdf_bytes = Some(file.bytes);
             }

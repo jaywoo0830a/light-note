@@ -34,12 +34,79 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 | `tool` | ② | 표본 → 획·지우개, press/drag/lift/cancel, **펜만 필기**, 압력(필압, 없으면 속도) |
 | `canvas` | ③ | 문서 + **구운 접두사** + **안 구운 꼬리**, 베이크 요청(latest-wins) |
 | `render` | ④ | `Frame` → WinUI 트리(키 diff), 베이크(워커), 가속키 |
-| `ui` | ④ | elm-magic 화면(`Screen`/`InkSurface`) + `<Raw>` 경계 |
+| `ui` | ④ | elm-magic 화면(`Screen` + 조각 슬롯 `<Raw>`) + `<Raw>` 경계, **전부 영어** |
+| `style` | ④ | **디자인 토큰** — 반지름·간격·글자 크기(플랫폼 무관, 테스트 대상) |
+| `parts` | ④ | 화면 조각 — **조각마다 파일 하나**: 머리글·미리보기·페이지 목록·상태바·종이 |
 | `shape` | ④ | **도형 하나를 정하는 곳** — 래스터·라이브·PDF가 모두 여기를 쓴다 |
 | `pdf` | 밖 | hayro로 PDF 열기/크기/래스터화(읽기 전용) |
 | `export` | 밖 | PNG / PDF(벡터 잉크 + 배경 이미지) |
 | `files` | 밖 | 네이티브 파일 대화상자(IFileDialog) |
 | `app` | 셸 | 4단계를 **순서대로 부르는 유일한 곳**(elm `Component`, 워커) |
+
+## 스타일과 언어 (windows-reactor 예제 21~30의 결론)
+
+이 백엔드는 `css!`/`class`를 읽지 않는다. 스타일을 만드는 통로는 **`<Raw>` 하나**이고,
+`<Raw>` 본문은 매크로가 그대로 복사하므로 그 안에서 elm 상태를 읽을 수도 없다. 그래서:
+
+- **화면(`ui.rs`)에는 버튼도 색도 간격도 없다** — 조각을 선언하고(`<Header />` 등) 값을
+  내려보낸다. **elm의 `<Button>`은 쓰지 않는다**: WinUI 기본 모양으로 굳어 아이콘·크기·
+  색·툴팁을 줄 방법이 없다.
+- **버튼은 조각이 만든다**(`parts/buttons.rs`). `<Raw>` 안에서 elm 콜백은 못 쓰지만
+  **호스트가 넘긴 `IntentSink`는 캡처할 수 있다** — 표면이 포인터 이벤트를 다루는 것과
+  같은 방법이다(`app.rs`가 `sender`를 캡처해 통로를 등록한다). 그래서 버튼 하나는
+  `Button::new().on_click(|| sink(intent))`이고, 아이콘은 WinUI 내장 `SymbolIcon`,
+  활성 도구는 `ButtonStyle::Accent`, 나머지는 `Subtle`(호버에만 배경)이며
+  **툴팁 + 자동화 이름을 항상 같이** 준다(아이콘만 있는 버튼의 접근성).
+- **조각마다 파일 하나 + 함수 하나**(`parts/`) — 앱바 · 툴바(버튼 + 잉크 미리보기) · 레일 ·
+  상태바 · 빈 상태 · 여는 중 · 실패 · 단축키 · 종이.
+- **정의는 플랫폼 무관**(`ui.rs`) — `Intent::TOOLBAR`/`Intent::RAIL`/`Intent::CHROME`가
+  "어떤 의도가 어디에 있는가"를 들고 있고 `tests/ui_plan.rs`가 빠짐·중복·라벨을 검증한다.
+  그리는 일만 WinUI가 한다.
+- **숫자와 색은 토큰 하나**(`style.rs`) — 간격은 4 DIP의 배수(4/8/12/16/24), 글자 크기는
+  내림차순 4단계, 색은 **테마 브러시 이름**이라 라이트/다크/고대비가 공짜로 따라온다.
+  규칙은 `tests/style.rs`가 고정한다.
+- 창 자체의 스타일(테마·Mica 배경)은 호스트만 만질 수 있다(`app.rs`의 `WindowVisuals`).
+
+### 레이아웃 (조각의 자리)
+
+```text
+Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
+└ 앱바      제목 · 배경(PDF) · 배지(페이지/배율/입력/저장 안 됨)   parts/header.rs
+├ 툴바      아이콘 버튼 14개(5묶음) + 잉크 미리보기(색·굵기)      parts/toolbar.rs
+├ 정보 띠   상태 문구 · 힌트 · 도구/획/파이프라인/배율            parts/status.rs
+├ 본문 ┬ 레일  페이지 목록(줄을 누르면 이동) · 조작 · 배율        parts/rail.rs
+│      └ 종이  잉크 표면 (빈 상태 안내 / 스피너 / 실패 카드)      render.rs · parts/{paper,empty,loading,failure}.rs
+└ 단축키    F1로 열고 Esc로 닫는다(호스트가 상태를 소유)          parts/shortcuts.rs
+```
+
+### 이 백엔드에서 **믿을 수 있는 것 / 없는 것** (실측으로 확인)
+
+| 쓰고 싶은 것 | 이 버전의 현실 |
+|---|---|
+| `StackPanel`(elm의 `<Col>`/`<Row>`) | ✅ 자식 전부 마운트되고 순서대로 배치된다 |
+| `width`/`height`/`opacity`/`margin` | ✅ `LayoutControl` 기본 속성은 내려간다 |
+| `HorizontalAlignment`/`VerticalAlignment` | ✅ 내려간다(단, 부모가 자식에게 폭을 줘야 의미가 있다) |
+| `Grid::columns()`(열 정의) + `Grid.Column` | ❌ 첫 열이 남은 폭을 다 먹어(무한 폭으로 측정) **둘째 열의 자식이 화면 밖으로** 나간다 |
+| `Grid` 한 셀 + 오른쪽 정렬 | ❌ 셀 폭이 0이라 자식이 **왼쪽 바깥**으로 밀린다 |
+| `RelativePanel` 정렬 attached property | ❌ 자식이 제자리에 남는다 |
+| `ScrollViewer`의 높이 | ⚠️ 창 크기(`on_window_size`)를 내려주면 스크롤이 생긴다 — **추정값**(`TOKENS.chrome_h`)에 기댄다 |
+
+그래서 배치는 **줄을 나누는 것**으로만 하고(양 끝 정렬 대신 두 줄), 잉크 영역 높이는
+호스트가 창 크기를 관측해 내려주며, 정보 띠는 **본문 위**에 둔다(추정이 틀려도 잘리는 것은
+종이의 아래쪽뿐이다).
+
+**사용자가 읽는 문자열은 전부 영어다**(버튼·상태 문구·힌트·오류·배지).
+`tests/ui_plan.rs::every_visible_string_is_english_only`가 비-ASCII 알파벳을 금지한다
+(`—`/`·`/`…` 같은 구두점은 허용).
+
+**폰트 — `Google Sans Flex`는 지금 적용할 수 없다**:
+Google Fonts의 `<link rel="stylesheet">`는 HTML/CSS 기법이라 네이티브 WinUI에는 넣을 자리가
+없고, WinUI에서 글꼴을 정하는 `TextBlock.FontFamily`를 `windows-reactor` 0.100이 **노출하지
+않는다**(`font_size`/`font_weight`/`foreground`/`text_wrapping`/`max_lines`/`text_trimming`만
+있다 — 예제 22의 결론). `ResourceOverrides`도 `Color`/`Thickness`/`CornerRadius`만 받는다.
+이름은 `style::Tokens::FONT_FAMILY`에 두었으니 업스트림이 `font_family`를 열면 그 한 곳만 쓰면
+된다. 지금은 WinUI 기본 글꼴(Windows 11의 `Segoe UI Variable`)로 두고, 타이포는
+**크기 · 굵기 · 색 · 자름** 네 축으로 만든다.
 
 ## 4단계 파이프라인
 

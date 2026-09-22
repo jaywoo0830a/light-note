@@ -16,12 +16,12 @@ pub enum Tool {
 impl Tool {
     pub const ALL: [Tool; 3] = [Tool::Pen, Tool::Highlighter, Tool::Eraser];
 
-    /// 화면 라벨 — UI와 테스트가 **같은 문자열**을 쓴다.
+    /// 화면 라벨 — UI와 테스트가 **같은 문자열**을 쓴다(**영어만**).
     pub const fn label(self) -> &'static str {
         match self {
-            Tool::Pen => "펜",
-            Tool::Highlighter => "형광펜",
-            Tool::Eraser => "지우개",
+            Tool::Pen => "Pen",
+            Tool::Highlighter => "Highlighter",
+            Tool::Eraser => "Eraser",
         }
     }
 
@@ -105,12 +105,12 @@ impl Style {
         self.width_pt * (0.45 + 0.55 * pressure.clamp(0.0, 1.0))
     }
 
-    /// 도구 안내 문구 — 상태바가 쓴다.
+    /// 도구 안내 문구 — 상태바가 쓴다(**영어만**).
     pub const fn hint(tool: Tool) -> &'static str {
         match tool {
-            Tool::Pen => "펜 — 빠르게 그으면 가늘어집니다",
-            Tool::Highlighter => "형광펜 — 반투명으로 덧칠합니다",
-            Tool::Eraser => "지우개 — 문지른 획을 통째로 지웁니다",
+            Tool::Pen => "Pen — draws thinner when you move fast",
+            Tool::Highlighter => "Highlighter — translucent, builds up on overlap",
+            Tool::Eraser => "Eraser — rubs out whole strokes",
         }
     }
 }

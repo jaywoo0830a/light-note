@@ -40,8 +40,9 @@ scale = Scale::DEFAULT(1.5) × zoom/100        // 1pt = scale 픽셀
 
 | 주체 | 소유 | 코드 |
 |---|---|---|
-| 셸(호스트) | 문서·PDF·도구·줌·**④-워커 예약** | `src/app.rs` (`Shell`) |
-| elm 화면 | 툴바/사이드바/상태바 + `<Raw>` **하나** | `src/ui.rs` |
+| 셸(호스트) | 문서·PDF·도구·줌·**④-워커 예약**·창 스타일·**의도 통로** | `src/app.rs` (`Shell`) |
+| elm 화면 | 구조(조각의 자리)와 분기(단계·단축키 패널) + F1/Esc → 의도 | `src/ui.rs` |
+| 조각(스타일·버튼) | 앱바·툴바·레일·상태바·안내·실패·단축키·종이의 생김새와 **버튼** | `src/parts/` (토큰은 `src/style.rs`) |
 | WinUI 트리 | 컨트롤 트리(베이스 `Image` 2장 + 꼬리 그룹) | `src/render.rs` |
 | ③ 캔버스 | 문서 + **구운 접두사**(`Base`) + **꼬리**(`Rc<[LiveInk]>`) | `src/canvas.rs` |
 | 모델 | 페이지·획·Undo/Redo | `src/doc.rs`, `src/ink.rs` |
@@ -73,7 +74,10 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 | ② | 디코드 싱크 등록 — `ImageOpened` → `HostMessage::Decoded(index)` | **승격의 유일한 신호** |
 | ③ | 가속기 등록 → 같은 큐 | `Ctrl +/-`, `Ctrl+Enter`만 지원(어댑터 한계) |
 | ④ | `ui::stage_frame(self.canvas.frame())` | `<Raw>` 클로저는 props/슬롯을 못 본다 — 발행 직전에 재료를 넣는다 |
-| ⑤ | `ScreenProps { view, on_intent }` → `ElmView<Screen>` | 호스트 → elm은 props, elm → 호스트는 **콜백 하나** |
+| ④-b | `ui::set_part_builder(parts::build)` + `ui::set_intent_sink(…)` + `ui::stage_view(view)` | 조각은 값·빌더·**의도 통로**가 다 있어야 그린다(버튼이 그 통로를 캡처한다) |
+| ④-c | `ui::set_surface_builder(… render::surface(frame, sink, decoded, view))` | 표면도 값(창 크기·단계)을 받는다 — 잉크 영역 높이와 빈 상태 안내가 그 안에 있다 |
+| ④-d | `context.on_window_size(…)` → `HostMessage::Resized` | 창 크기가 **잉크 영역 높이의 유일한 근거**다(elm 트리는 StackPanel뿐이라 높이가 안 묶인다) |
+| ⑤ | `ScreenProps { view, on_intent }` → `ElmView<Screen>` → **루트 `Grid`에 가속기** | 호스트 → elm은 props, elm → 호스트는 **의도 하나**. 가속기는 포커스와 무관하게 창 전체에 걸린다 |
 
 그리고 elm이 `<Raw>`를 만나면(`ui.rs`):
 
@@ -83,6 +87,28 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
         *out = builder(&frame);          // → render::surface(트리)
     }
 }</Raw>
+```
+
+조각도 같은 방식이다 — 화면은 **무엇이 필요한가**만 말한다:
+
+```rust
+pub fn Header() {                       // ui.rs (앱바)
+    <Raw>|out: &mut SurfaceSlot| {
+        *out = part(Part::Header);       // 값·빌더·통로가 있으면 parts::header::header(view)
+    }</Raw>
+}
+```
+
+**버튼은 조각이 만들되 의도는 호스트가 받는다** — `<Raw>` 안에서 elm 콜백은 못 쓰지만
+호스트가 등록한 통로는 쓸 수 있다(`parts/buttons.rs`):
+
+```rust
+Button::new()
+    .style(ButtonStyle::Subtle)                 // 활성 도구는 Accent
+    .automation_name(intent.label())
+    .on_click(move || sink(intent))              // sink: Rc<dyn Fn(Intent)> — app.rs가 만든다
+    .content(SymbolIcon::new().symbol(symbol(intent)))
+    .tooltip(intent.label())
 ```
 
 `Frame`은 **스냅샷**이다: `base`(`Rc` 2장 + 페이지/배율/획 수) / `tail`(`Rc<[LiveInk]>`) /
@@ -302,7 +328,7 @@ slots = [ Slot { png: None, page: 0, scale, count: 0 },
 | 디코드 신호가 안 옴 | **기다리지 않는다** — 옛 접두사 + 꼬리로 완전(타이머·안전망 없음) | `canvas.rs` |
 | 페이지 이동 / 줌 | `drop_staged()` + `invalidate()` — 대기 중 그림은 다른 페이지·배율의 것이다 | `canvas.rs` |
 | 빈 페이지 | `has_ink == false` → 워커를 부르지 않고 `empty_result()`(그림 없음 = 빈 접두사) | `canvas.rs` |
-| 자리를 채우는 오류 | `Stage::Failed(이유)` + **같은 자리에** "다시 시도" 버튼 | `ui.rs` |
+| 자리를 채우는 오류 | `Stage::Failed(이유)` + **같은 자리에** "Retry" 버튼 | `ui.rs` |
 | 파일 열기/내보내기 | 워커에서 처리, 결과만 메시지로(`PdfDocument`는 넘기지 않는다 — `Send` 제약) | `app.rs`, `files.rs`, `export.rs` |
 
 ## 비용 (release, A4 595×842pt @ scale 1.5 = 893×1263px, 예제 `bake_cost` 실측)
@@ -322,15 +348,17 @@ slots = [ Slot { png: None, page: 0, scale, count: 0 },
 ## WinUI 트리 (키 포함)
 
 ```text
-Grid                        key_accelerators(Ctrl+±, Ctrl+Enter)
-└ Border                    종이 배경 + **포인터 이벤트**(Canvas에는 없다)
-  └ Canvas                  width/height = 페이지 픽셀(=DIP), 절대 좌표
-    ├ Image  "base-0"       베이스 자리 A (EncodedImage, Stretch::None)
-    ├ Image  "base-1"       베이스 자리 B — 보이는 쪽만 (0,0), 나머지는 (-10000,-10000)
-    ├ Canvas "tail-i"       꼬리 획 i = 한 합성 그룹, Opacity = 색의 알파/255
-    │ ├ Line    "line-j"    구간 사각형(양 끝을 반지름만큼 늘림), StrokeThickness = 폭
-    │ └ Ellipse "cap-j"     둥근 캡(지름 = 폭), Canvas.Left/Top = 중심 - 반지름
-    └ Canvas "drawing"      진행 중 획 (같은 모양)
+Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app.rs)
+└ Col(elm)                  앱바 · 툴바 · 정보 띠 · 본문 · 단축키 (조각은 전부 <Raw>)
+  └ Border                  책상(둘레 24 DIP) → 스크롤 상자(높이 = 창 − 크롬) 안
+    └ Border                종이 배경 + **포인터 이벤트**
+      └ Canvas              width/height = 페이지 픽셀(=DIP), 절대 좌표
+        ├ Image  "base-0"       베이스 자리 A (EncodedImage, Stretch::None)
+        ├ Image  "base-1"       베이스 자리 B — 보이는 쪽만 (0,0), 나머지는 (-10000,-10000)
+        ├ Canvas "tail-i"       꼬리 획 i = 한 합성 그룹, Opacity = 색의 알파/255
+        │ ├ Line    "line-j"    구간 사각형(양 끝을 반지름만큼 늘림), StrokeThickness = 폭
+        │ └ Ellipse "cap-j"     둥근 캡(지름 = 폭), Canvas.Left/Top = 중심 - 반지름
+        └ Canvas "drawing"      진행 중 획 (같은 모양)
 ```
 
 `KeyedView`의 키가 곧 diff 단위다 — 도형이 늘어도 앞쪽은 그대로 두고 끝만 바뀐다.
@@ -350,7 +378,13 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter)
 | 라이브 도형 = 래스터 잉크(바이트 차이 0) | `geometry::*_matches_between_live_and_raster` |
 | 관절을 덮는 확장 규칙 / 이중 합성 없음 | `geometry::the_joint_is_covered_by_the_extended_span`, `a_translucent_joint_does_not_double_blend` |
 | 화면 → 의도 매핑과 상태 분기 | `ui_plan::*` |
+| 버튼 정의가 모든 의도를 한 번씩 담고, 라벨이 중복되지 않는다 | `ui_plan::the_chrome_definition_covers_every_intent_once` |
+| elm 계획에 기본 버튼/글자가 **하나도** 없다 | `ui_plan::no_elm_buttons_remain` |
+| 조각이 받는 값 = 화면이 받은 `ViewModel`, 통로로 보낸 의도가 호스트에 도착 | `ui_plan::the_chrome_values_and_intent_sink_reach_the_parts` |
+| F1/Esc가 **의도로** 호스트에 간다(elm은 상태를 소유하지 않는다) | `ui_plan::the_f1_and_escape_keys_send_intents` |
 | 표면은 `<Raw>` **하나**로 붙고 재료가 그대로 도착 | `ui_plan::the_surface_reaches_the_registered_builder_through_one_raw_slot` |
+| 화면 언어는 **영어만** | `ui_plan::every_visible_string_is_english_only` |
+| 토큰 규칙(4 DIP 리듬·타이포 내림차순·알약 관례·컨트롤 눈금) | `style::*` |
 | 인코딩 계약(BOM·UTF-8·CRLF) | `encoding::*` |
 
 ## 더 읽을 곳
@@ -359,4 +393,5 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter)
 - `crates/light-note-gui/src/canvas.rs` — ③(접두사·꼬리·베이크 예약·승격)
 - `crates/light-note-gui/src/shape.rs` — 도형 결정(`ink_shape`)·폴리라인 펴기·합집합 채움
 - `crates/light-note-gui/src/render.rs` — ④(WinUI 트리·베이크·가속기)
+- `crates/light-note-gui/src/parts/` — 화면 조각(조각마다 파일 하나) + `src/style.rs` 토큰
 - `crates/light-note-gui/src/app.rs` — 셸(메시지·워커·승격)

@@ -23,16 +23,17 @@ use std::rc::Rc;
 
 use elm_magic_windows_reactor::RawSlot;
 use windows_reactor::{
-    AcceleratorKey, AcceleratorModifiers, Border, Brush, Canvas, CanvasChildExt, ChildrenControl,
-    Color, ContentControl, CornerRadius, Ellipse, EncodedImage, Grid, Image, KeyAccelerator,
-    KeyAccelerators, KeyedView, LayoutControl, Line, PointerEventInfo, Stretch, ThemeBrush,
-    Thickness, View,
+    AcceleratorKey, AcceleratorModifiers, Brush, Canvas, CanvasChildExt, ChildrenControl, Color,
+    ContentControl, Ellipse, EncodedImage, Image, KeyAccelerator, KeyAccelerators, KeyedView,
+    LayoutControl, Line, PointerEventInfo, Stretch, View,
 };
 
 use crate::canvas::{BakeRequest, BakeResult, Base};
 use crate::input::{InputSink, Phase};
+use crate::parts;
 use crate::shape::{self, LiveCap, LiveInk, LiveLine};
-use crate::ui::{Frame, Intent};
+use crate::style::TOKENS;
+use crate::ui::{Frame, Intent, Stage, ViewModel};
 
 /// 숨은 그림을 밀어 두는 창 밖 좌표 — 어떤 창 크기에서도 보이지 않는다.
 const PARKED: f64 = -10_000.0;
@@ -43,12 +44,13 @@ const PARKED: f64 = -10_000.0;
 pub type ImageSink = Rc<dyn Fn(usize)>;
 
 /// ③의 상태 → WinUI 트리. `<Raw>`가 [`crate::ui::surface_builder`]로 부른다.
-pub fn surface(
-    frame: &Frame,
-    sink: &InputSink,
-    decoded: &ImageSink,
-    accelerators: KeyAccelerators,
-) -> RawSlot {
+///
+/// 가속기는 **루트**(`app.rs`)에 붙는다 — 여기 붙이면 툴바 버튼을 누른 순간
+/// 포커스가 표면 밖으로 나가면서 Ctrl+±가 죽는다.
+///
+/// 잉크 영역의 **높이**(`view.viewport` → 스크롤 상자)와 **빈 상태 안내**는 표면의 내용이라
+/// 여기서 정한다(호스트는 값을 내려보낼 뿐이다).
+pub fn surface(frame: &Frame, sink: &InputSink, decoded: &ImageSink, view: &ViewModel) -> RawSlot {
     let (width, height) = frame.scale.pixels(frame.size);
     let base = &frame.base;
 
@@ -84,12 +86,8 @@ pub fn surface(
     let lost = Rc::clone(sink);
     let canceled = Rc::clone(sink);
 
-    let paper = Border::new()
-        .background(Brush::from(ThemeBrush::SolidBackground))
-        .border_brush(Brush::from(ThemeBrush::CardStroke))
-        .border_thickness(Thickness::uniform(1.0))
-        .corner_radius(CornerRadius::uniform(4.0))
-        .padding(Thickness::uniform(0.0))
+    // 겉모습(면·선·반지름)은 조각이 만든다 — 여기서는 **동작**만 붙인다(예제 24/30의 분리).
+    let paper = parts::paper::frame()
         .capture_pointer_on_press(true)
         .on_pointer_pressed(move |info: PointerEventInfo| pressed(Phase::Pressed, info.x, info.y))
         .on_pointer_moved(move |info: PointerEventInfo| moved(Phase::Moved, info.x, info.y))
@@ -101,11 +99,16 @@ pub fn surface(
         .on_pointer_canceled(move || canceled(Phase::Canceled, 0.0, 0.0))
         .content(canvas);
 
-    Some(
-        Grid::new()
-            .key_accelerators(accelerators)
-            .children((paper,)),
-    )
+    // 페이지는 창보다 크다 — 종이를 **책상 위에 놓고, 창 높이만큼만 보여준다**(스크롤).
+    // 빈 상태 안내도 **같은 스크롤 안**에 둔다: 밖에 두면 잉크 영역 높이가 단계마다 달라져
+    // 크롬(상태바)이 화면 밖으로 밀린다.
+    let sheet: View = parts::paper::desk(paper);
+    let content = if view.stage == Stage::Empty {
+        parts::column(TOKENS.gap, vec![parts::empty::empty(view), sheet])
+    } else {
+        sheet
+    };
+    Some(parts::paper::scroll(content, parts::content_height(view)))
 }
 
 /// 베이스 한 장 → WinUI `Image`.

@@ -35,10 +35,12 @@ pub enum PdfError {
 impl std::fmt::Display for PdfError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PdfError::Io(message) => write!(formatter, "파일을 읽지 못했습니다: {message}"),
-            PdfError::Parse(message) => write!(formatter, "PDF를 해석하지 못했습니다: {message}"),
-            PdfError::NoPages => write!(formatter, "페이지가 없는 PDF입니다"),
-            PdfError::PageOutOfRange(index) => write!(formatter, "페이지 {}가 없습니다", index + 1),
+            PdfError::Io(message) => write!(formatter, "Could not read the file: {message}"),
+            PdfError::Parse(message) => write!(formatter, "Could not parse the PDF: {message}"),
+            PdfError::NoPages => write!(formatter, "The PDF has no pages"),
+            PdfError::PageOutOfRange(index) => {
+                write!(formatter, "Page {} does not exist", index + 1)
+            }
         }
     }
 }
@@ -98,7 +100,7 @@ impl PdfDocument {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "메모리 PDF".to_string())
+            .unwrap_or_else(|| "in-memory PDF".to_string())
     }
 
     pub fn page_count(&self) -> usize {

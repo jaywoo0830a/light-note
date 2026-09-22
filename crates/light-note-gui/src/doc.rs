@@ -99,8 +99,8 @@ impl Page {
     /// 상태바/도움말용 한 줄.
     pub fn describe(&self) -> String {
         match self.background {
-            Some(page) => format!("PDF {}쪽 · 획 {}개", page + 1, self.stroke_count()),
-            None => format!("빈 페이지 · 획 {}개", self.stroke_count()),
+            Some(page) => format!("PDF page {} · {} strokes", page + 1, self.stroke_count()),
+            None => format!("Blank page · {} strokes", self.stroke_count()),
         }
     }
 }
@@ -143,13 +143,14 @@ impl Edit {
         }
     }
 
+    /// 이 편집의 이름 — 상태바가 쓴다(**영어만**).
     pub fn label(&self) -> &'static str {
         match self {
-            Edit::AddStroke { .. } => "필기",
-            Edit::RemoveStrokes { .. } => "지우기",
-            Edit::ClearPage { .. } => "페이지 비우기",
-            Edit::InsertPage { .. } => "페이지 추가",
-            Edit::RemovePage { .. } => "페이지 삭제",
+            Edit::AddStroke { .. } => "Ink",
+            Edit::RemoveStrokes { .. } => "Erase",
+            Edit::ClearPage { .. } => "Clear page",
+            Edit::InsertPage { .. } => "Add page",
+            Edit::RemovePage { .. } => "Remove page",
         }
     }
 
@@ -233,7 +234,7 @@ impl Doc {
     /// 빈 A4 한 장으로 시작한다.
     pub fn blank(size: Size) -> Self {
         Self {
-            title: "무제".to_string(),
+            title: "Untitled".to_string(),
             pages: vec![Page::blank(size)],
             active: 0,
             history: History::default(),
@@ -500,12 +501,12 @@ impl Doc {
     /// 상태바 한 줄 — UI와 테스트가 같은 문자열을 본다.
     pub fn status_line(&self) -> String {
         format!(
-            "{} · {} / {}페이지 · 획 {}개{}",
+            "{} · page {} / {} · {} strokes{}",
             self.title,
             self.active + 1,
             self.pages.len(),
             self.active_page().stroke_count(),
-            if self.dirty { " · 저장 안 됨" } else { "" }
+            if self.dirty { " · Unsaved" } else { "" }
         )
     }
 }

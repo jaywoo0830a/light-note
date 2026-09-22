@@ -43,12 +43,12 @@ pub enum ExportError {
 impl std::fmt::Display for ExportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExportError::Io(message) => write!(formatter, "파일을 쓰지 못했습니다: {message}"),
+            ExportError::Io(message) => write!(formatter, "Could not write the file: {message}"),
             ExportError::Raster(message) => {
-                write!(formatter, "이미지를 만들지 못했습니다: {message}")
+                write!(formatter, "Could not build the image: {message}")
             }
             ExportError::Background(message) => {
-                write!(formatter, "PDF 배경을 그리지 못했습니다: {message}")
+                write!(formatter, "Could not draw the PDF background: {message}")
             }
         }
     }

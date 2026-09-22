@@ -58,9 +58,9 @@ impl Device {
     /// 상태바가 읽는 이름 — **사용자가 읽는 문자열**이다.
     pub const fn label(self) -> &'static str {
         match self {
-            Device::Pen => "펜",
-            Device::Touch => "손가락",
-            Device::Mouse => "마우스",
+            Device::Pen => "Pen",
+            Device::Touch => "Touch",
+            Device::Mouse => "Mouse",
         }
     }
 }

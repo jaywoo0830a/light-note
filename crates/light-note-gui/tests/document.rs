@@ -31,7 +31,7 @@ fn a_stroke_is_one_edit_and_undo_restores_the_page() {
     assert_eq!(index, 0, "첫 획의 인덱스는 0");
     assert_eq!(doc.strokes().len(), 1);
     assert!(doc.can_undo() && !doc.can_redo());
-    assert_eq!(doc.last_edit(), Some("필기"), "상태바가 편집 이름을 안다");
+    assert_eq!(doc.last_edit(), Some("Ink"), "상태바가 편집 이름을 안다");
 
     assert!(doc.undo().is_some());
     assert_eq!(doc.strokes().len(), 0);
@@ -230,19 +230,19 @@ fn document_from_pdf_keeps_page_sizes_and_backgrounds() {
 fn status_line_reports_position_and_dirty() {
     let mut doc = Doc::blank(Size::A4);
     let clean = doc.status_line();
-    assert!(clean.contains("1 / 1페이지"), "{clean}");
-    assert!(!clean.contains("저장 안 됨"));
+    assert!(clean.contains("page 1 / 1"), "{clean}");
+    assert!(!clean.contains("Unsaved"));
 
     commit(&mut doc, Pt::new(10.0, 10.0), Pt::new(80.0, 10.0));
     doc.add_page_after_active(Size::A4);
     assert!(doc.is_dirty());
     let dirty = doc.status_line();
-    assert!(dirty.contains("2 / 2페이지"), "{dirty}");
-    assert!(dirty.contains("저장 안 됨"), "{dirty}");
+    assert!(dirty.contains("page 2 / 2"), "{dirty}");
+    assert!(dirty.contains("Unsaved"), "{dirty}");
 
     doc.mark_saved();
     assert!(!doc.is_dirty());
-    assert!(!doc.status_line().contains("저장 안 됨"));
+    assert!(!doc.status_line().contains("Unsaved"));
 }
 
 #[test]
@@ -251,5 +251,5 @@ fn a_blank_page_has_no_strokes_and_a_stable_size() {
     assert!(page.is_empty());
     assert_eq!(page.stroke_count(), 0);
     assert_eq!(page.background(), None);
-    assert_eq!(page.describe(), "빈 페이지 · 획 0개");
+    assert_eq!(page.describe(), "Blank page · 0 strokes");
 }
