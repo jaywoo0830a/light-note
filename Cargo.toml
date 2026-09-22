@@ -23,3 +23,6 @@ windows-reactor = "0.100"
 rfd = "0.15"
 # Win32 `WM_POINTER` — 디지타이저(펜) 장치·필압·틸트. Windows 대상에서만 컴파일된다.
 windows = "0.62"
+# OTD RPC(폴백)의 JSON — 공유 메모리 경로는 JSON을 아예 쓰지 않는다.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

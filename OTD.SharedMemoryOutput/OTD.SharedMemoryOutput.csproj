@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    OTD 플러그인 — OTD 0.6.7이 .NET 8로 돌기 때문에 런타임도 net8.0이어야 한다.
+    (이 PC에는 런타임 8.0.30이 있지만 **SDK가 없다** → 빌드하려면 `Microsoft.DotNet.SDK.8`이 필요하다.)
+
+    `OpenTabletDriver.Plugin`은 NuGet에 0.6.7까지 올라와 있다. 설치 폴더에는 dll이 없으므로
+    (단일 파일 exe) NuGet이 유일한 참조 경로다.
+
+    **`ExcludeAssets="runtime"`이 중요하다**: 이 dll을 플러그인 폴더로 복사하면
+    OTD의 격리된 로딩 컨텍스트가 타입을 두 벌로 보게 되어 `IOutputMode` 같은 인터페이스가
+    서로 다른 타입이 된다(플러그인이 "그 인터페이스를 구현하지 않았다"고 판정된다).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>OTD.SharedMemoryOutput</AssemblyName>
+    <RootNamespace>OTD.SharedMemoryOutput</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- 경고를 오류로: 플러그인은 daemon 안에서 돌아 디버깅이 어렵다. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.7">
+      <PrivateAssets>all</PrivateAssets>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+</Project>

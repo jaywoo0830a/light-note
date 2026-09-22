@@ -10,3 +10,7 @@
 .vs/
 .vscode/
 .DS_Store
+
+# C# 플러그인 빌드 산출물 (OTD.SharedMemoryOutput — OTD 플러그인은 dll만 필요하다)
+OTD.SharedMemoryOutput/bin/
+OTD.SharedMemoryOutput/obj/

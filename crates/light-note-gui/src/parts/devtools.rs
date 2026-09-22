@@ -27,8 +27,9 @@ pub fn devtools(view: &ViewModel, sink: &IntentSink) -> RawSlot {
     let mut rows: Vec<View> = vec![
         label("Diagnostics", TOKENS.title, FontWeight::SEMI_BOLD).into(),
         meta_wrapped(
-            "Pen input needs three gates: a pen digitizer, a hook on the window that receives \
-             input, and pen messages reaching it.",
+            "Pen input comes from OpenTabletDriver: a plugin writes tablet reports into shared \
+             memory and this app reads them. If nothing arrives, the OTD daemon or the plugin is \
+             missing.",
         )
         .into(),
     ];
@@ -48,7 +49,7 @@ pub fn devtools(view: &ViewModel, sink: &IntentSink) -> RawSlot {
         TOKENS.gap,
         vec![
             buttons::label_button(Intent::Rescan.label(), Intent::Rescan, sink),
-            meta("Finds new windows and hooks them; counters are kept.").into(),
+            meta("Reopens the shared memory and re-reads the tablet range.").into(),
         ],
     ));
     Some(card(TOKENS.pad, column(TOKENS.gap, rows)))

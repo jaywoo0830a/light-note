@@ -1,7 +1,7 @@
 //! light-note-gui — **윈도우 11 전용** 필기 앱. 하나의 크레이트, 하나의 파이프라인(4단계).
 //!
 //! ```text
-//! ① HardwareInput  [UI]   WinUI 포인터 + Win32 WM_POINTER → Sample   (input, digitizer)
+//! ① HardwareInput  [UI]   태블릿(OTD) 펜 표본 → Sample        (input, otd)
 //! ② CanvasTool     [UI]   Sample → 획 + 라이브 기하         (tool)
 //! ③ Canvas         [UI]   상태만: 획 목록 · 구운 접두사 · 안 구운 꼬리  (canvas)
 //! ④ Render         [UI]   Canvas → WinUI 트리(키 diff)      (render)
@@ -9,8 +9,10 @@
 //! ```
 //!
 //! **디지타이저(펜)만 필기한다**: 드로잉 패드 친화 필기 앱이라 손가락·마우스는 잉크를
-//! 만들지 않는다([`tool::CanvasTool::accepts`]). 장치 판정은 Win32 `WM_POINTER`를 읽는
-//! [`digitizer`]가 하고(필압·틸트도 거기서 온다), WinUI는 장치를 알려주지 않는다.
+//! 만들지 않는다([`tool::CanvasTool::accepts`]). 펜 표본은 **OpenTabletDriver**에서 온다 —
+//! 플러그인(`OTD.SharedMemoryOutput`)이 공유 메모리에 쓰고 [`otd::shm`]가 읽는다(플러그인이
+//! 없으면 JSON-RPC 폴백). **WinUI 포인터 이벤트는 잉크에 쓰이지 않는다**: 좌표·필압·틸트가
+//! 모두 태블릿에서 오고, 창은 그리는 일만 한다.
 //!
 //! 규칙은 셋뿐이고, 그 셋이 이 크레이트의 계약이다:
 //!
@@ -37,13 +39,13 @@
 
 pub mod app;
 pub mod canvas;
-pub mod digitizer;
 pub mod doc;
 pub mod export;
 pub mod files;
 pub mod geom;
 pub mod ink;
 pub mod input;
+pub mod otd;
 pub mod parts;
 pub mod pdf;
 pub mod render;

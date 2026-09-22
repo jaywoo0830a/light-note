@@ -25,11 +25,10 @@ use elm_magic_windows_reactor::RawSlot;
 use windows_reactor::{
     AcceleratorKey, AcceleratorModifiers, Brush, Canvas, CanvasChildExt, ChildrenControl, Color,
     ContentControl, Ellipse, EncodedImage, Image, KeyAccelerator, KeyAccelerators, KeyedView,
-    LayoutControl, Line, PointerEventInfo, Stretch, View,
+    LayoutControl, Line, Stretch, View,
 };
 
 use crate::canvas::{BakeRequest, BakeResult, Base};
-use crate::input::{InputSink, Phase};
 use crate::parts;
 use crate::shape::{self, LiveCap, LiveInk, LiveLine};
 use crate::style::TOKENS;
@@ -50,7 +49,9 @@ pub type ImageSink = Rc<dyn Fn(usize)>;
 ///
 /// 잉크 영역의 **높이**(`view.viewport` → 스크롤 상자)와 **빈 상태 안내**는 표면의 내용이라
 /// 여기서 정한다(호스트는 값을 내려보낼 뿐이다).
-pub fn surface(frame: &Frame, sink: &InputSink, decoded: &ImageSink, view: &ViewModel) -> RawSlot {
+/// **포인터 훅이 없다**: 잉크는 태블릿(OTD)에서 오고 창은 그리는 일만 한다 — 마우스로 종이를
+/// 끌어도 획이 생기지 않는다(정책은 [`crate::tool::CanvasTool::accepts`]에 있다).
+pub fn surface(frame: &Frame, decoded: &ImageSink, view: &ViewModel) -> RawSlot {
     let (width, height) = frame.scale.pixels(frame.size);
     let base = &frame.base;
 
@@ -80,24 +81,8 @@ pub fn surface(frame: &Frame, sink: &InputSink, decoded: &ImageSink, view: &View
         .height(height as f64)
         .keyed_children(children);
 
-    let pressed = Rc::clone(sink);
-    let moved = Rc::clone(sink);
-    let released = Rc::clone(sink);
-    let lost = Rc::clone(sink);
-    let canceled = Rc::clone(sink);
-
     // 겉모습(면·선·반지름)은 조각이 만든다 — 여기서는 **동작**만 붙인다(예제 24/30의 분리).
-    let paper = parts::paper::frame()
-        .capture_pointer_on_press(true)
-        .on_pointer_pressed(move |info: PointerEventInfo| pressed(Phase::Pressed, info.x, info.y))
-        .on_pointer_moved(move |info: PointerEventInfo| moved(Phase::Moved, info.x, info.y))
-        .on_pointer_released(move |info: PointerEventInfo| {
-            released(Phase::Released, info.x, info.y)
-        })
-        // 취소는 두 경로로 온다 — 둘 다 하나로 모은다.
-        .on_pointer_capture_lost(move || lost(Phase::Canceled, 0.0, 0.0))
-        .on_pointer_canceled(move || canceled(Phase::Canceled, 0.0, 0.0))
-        .content(canvas);
+    let paper = parts::paper::frame().content(canvas);
 
     // 페이지는 창보다 크다 — 종이를 **책상 위에 놓고, 창 높이만큼만 보여준다**(스크롤).
     // 빈 상태 안내도 **같은 스크롤 안**에 둔다: 밖에 두면 잉크 영역 높이가 단계마다 달라져

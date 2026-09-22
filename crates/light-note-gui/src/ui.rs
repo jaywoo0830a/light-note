@@ -55,9 +55,9 @@ pub enum Intent {
     CloseHelp,
     /// 페이지 목록에서 고른 페이지 — 툴바 버튼이 아니라 **레일의 줄**이 보낸다.
     GoToPage(usize),
-    /// **개발자 도구** 열기/닫기 — 디지타이저 진단(툴바의 마지막 버튼).
+    /// **개발자 도구** 열기/닫기 — 태블릿 입력 진단(툴바의 마지막 버튼).
     ToggleDev,
-    /// 개발자 도구의 **리스캔** — 창을 다시 찾아 훅을 건다.
+    /// 개발자 도구의 **다시 연결** — OTD 플러그인을 다시 찾는다(방금 설치했거나 데몬을 다시 띄웠을 때).
     Rescan,
 }
 
@@ -153,7 +153,7 @@ impl Intent {
             Intent::ToggleHelp => "Keyboard shortcuts",
             Intent::CloseHelp => "Close shortcuts",
             Intent::ToggleDev => "Diagnostics",
-            Intent::Rescan => "Rescan windows",
+            Intent::Rescan => "Reconnect OTD",
             Intent::GoToPage(_) => "Go to page",
         }
     }

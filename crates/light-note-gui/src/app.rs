@@ -27,9 +27,9 @@
 //! [`HostMessage`]는 `Send`여야 한다(`spawn_background` 요구). 그래서 **PDF 문서를 메시지에
 //! 넣지 않는다** — 워커가 필요하면 바이트에서 다시 파싱한다.
 
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use elm_magic::Callback;
 use elm_magic_windows_reactor::{ElmInput, ElmView};
@@ -40,12 +40,12 @@ use windows_reactor::{
 };
 
 use crate::canvas::{BakeResult, Canvas};
-use crate::digitizer;
 use crate::export::{self, EXPORT_SCALE};
 use crate::files::{self, OpenedFile};
 use crate::geom::Size;
 use crate::ink::Tool;
 use crate::input::{self, Phase};
+use crate::otd::{self, Feed};
 use crate::parts;
 use crate::pdf::PdfDocument;
 use crate::render;
@@ -56,8 +56,8 @@ use crate::ui::{self, Frame, Intent, Screen, ScreenProps, Stage, ViewModel};
 /// 호스트 메시지 — `spawn_background`가 돌려주므로 **`Send`**여야 한다.
 #[derive(Clone, Debug)]
 pub enum HostMessage {
-    /// ① 입력 — 표면 DIP 좌표 + 위상 + **하드웨어 프레임**(펜이면 장치·필압·틸트).
-    Pointer(Phase, f64, f64, Option<input::PointerFrame>),
+    /// ① 입력 — 태블릿(OTD)이 보낸 표본 묶음. 좌표는 **이미 페이지 pt**다(어댑터가 옮겼다).
+    Tablet(otd::Batch),
     /// elm 화면의 의도.
     Intent(Intent),
     /// ④-워커가 구운 베이스.
@@ -92,19 +92,31 @@ pub struct Shell {
     status: String,
     /// 단축키 패널이 열려 있는가 — **호스트가 소유**한다(조각이 그리기만 한다).
     help: bool,
-    /// **개발자 도구**(디지타이저 진단)가 열려 있는가 — 이것도 호스트가 소유한다.
+    /// **개발자 도구**(태블릿 입력 진단)가 열려 있는가 — 이것도 호스트가 소유한다.
     dev: bool,
-    /// WinUI 표면이 받은 포인터 이벤트 수 — **훅과 UI 경로를 가르는 숫자**다.
-    ///
-    /// 디지타이저 훅이 죽어 있어도 표면에는 이벤트가 온다. 이 수가 0이면 문제는 훅이 아니라
-    /// UI 경로다(진단 표의 첫 줄이 이 값을 말한다).
-    ui_events: Rc<Cell<u64>>,
     /// 창의 클라이언트 크기 (DIP) — 잉크 영역 높이의 근거(관측이 오기 전에는 기본값).
     viewport: (f64, f64),
     /// 끌어놓기 안내를 띄우기 **전의** 상태 문구 — 나가면 이 값으로 되돌린다.
     status_before_drop: Option<String>,
     /// ④-워커에 가 있는 요청 id — **R2: 한 번에 하나**([`Canvas::needs_bake`]).
     baking: Option<u64>,
+    /// 태블릿 범위 — 공유 메모리 헤더가 모르면 RPC로 한 번 받는다(좌표 매핑의 근거).
+    tablet: Option<otd::TabletSpec>,
+    /// 표본 스트림 — **UI가 계속 들고 있다**(복제를 백그라운드로 넘긴다).
+    stream: otd::Stream,
+    /// 다시 연결을 요청하는 손잡이 — `stream`이 대기 중이어도 쓸 수 있다.
+    kick: Option<otd::session::Kick>,
+    /// 태블릿 표본 → 제스처. 범위를 알기 전에는 없다.
+    feed: Option<Feed>,
+    /// 연결 상태(플러그인이 살아 있는가·`write_seq`·버린 수).
+    otd: Option<otd::session::Live>,
+    /// 연결·RPC가 실패한 이유 — 진단 표가 그대로 보여준다.
+    otd_problem: Option<String>,
+    /// 태블릿 표본이 실제로 온 수 — 초당 표본 수의 근거다.
+    otd_count: u64,
+    /// 초당 표본 수를 재는 기준(마지막으로 잰 표본 수와 시각)과 그 결과.
+    otd_mark: (u64, Instant),
+    otd_rate: f32,
 }
 
 impl Component for Shell {
@@ -118,23 +130,35 @@ impl Component for Shell {
             pdf: None,
             pdf_bytes: None,
             stage: Stage::Empty,
-            status: "New note — draw with a pen (digitizer)".to_string(),
+            status: "New note — draw with the tablet pen".to_string(),
             help: false,
             dev: false,
-            ui_events: Rc::new(Cell::new(0)),
             viewport: (1280.0, 800.0),
             status_before_drop: None,
             baking: None,
+            tablet: None,
+            // 표본 스레드를 **여기서** 띄운다: 첫 발행 전에 이미 링을 읽고 있다.
+            stream: otd::session::start(),
+            kick: None,
+            feed: None,
+            otd: None,
+            otd_problem: None,
+            otd_count: 0,
+            otd_mark: (0, Instant::now()),
+            otd_rate: 0.0,
         };
+        // 다시 연결 손잡이는 UI가 들고 있어야 한다 — 버튼이 **대기 중에도** 쓸 수 있다.
+        shell.kick = Some(shell.stream.kick_handle());
+        // 첫 묶음을 기다리기 시작한다 — 메시지가 올 때마다 **다시 건다**(자기 재예약).
+        shell.wait_for_samples(context);
         shell.refresh(context);
         shell
     }
 
     fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
-        // 창이 첫 발행보다 늦게 생길 수 있다 — 메시지마다 한 번 더 시도한다(이미 걸렸으면 공짜다).
-        digitizer::install();
         match message {
-            HostMessage::Pointer(phase, x, y, frame) => self.pointer(phase, x, y, frame),
+            // 태블릿 표본 — ②로 가는 **유일한** 입력이다(다음 묶음도 여기서 다시 건다).
+            HostMessage::Tablet(batch) => self.tablet(batch, context),
             HostMessage::Intent(intent) => self.intent(intent, context),
             HostMessage::Baked(result) => self.adopt_bake(result),
             HostMessage::Decoded(_) => {
@@ -164,9 +188,6 @@ impl Component for Shell {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
-        // ①-하드웨어: Win32 `WM_POINTER` 훅을 건다(창이 아직 없으면 다음 프레임에 다시 시도한다).
-        digitizer::install();
-
         // 창 제목은 호스트가 정한다(elm은 플랫폼을 모른다 — 예제 20).
         context.window_title(format!("light-note — {}", self.canvas.doc().title()));
 
@@ -198,17 +219,6 @@ impl Component for Shell {
             let _ = resize_sender.send(HostMessage::Resized(size.width, size.height));
         });
 
-        // ① 포인터 → 메시지 큐. 표면 빌더가 이 싱크를 **캡처**한다(예제 08).
-        let pointer_sender = sender.clone();
-        let ui_events = Rc::clone(&self.ui_events);
-        let sink: input::InputSink = Rc::new(move |phase, x, y| {
-            // 진단: WinUI 경로가 살아 있는가 — 훅이 죽어도 이 수는 는다.
-            ui_events.set(ui_events.get().wrapping_add(1));
-            // 이벤트 **순간**의 펜 프레임을 붙인다 — 큐를 거친 뒤에 읽으면 이미 낡았다.
-            let frame = digitizer::latest();
-            let _ = pointer_sender.send(HostMessage::Pointer(phase, x, y, frame));
-        });
-
         // ④ 디코드 완료 → 앞자리 교체. **이 신호 뒤에만** 화면이 바뀐다(빈 프레임 없음).
         let decoded_sender = sender.clone();
         let decoded: render::ImageSink = Rc::new(move |index| {
@@ -222,7 +232,7 @@ impl Component for Shell {
             let _ = accelerator_sender.send(HostMessage::Intent(intent));
         });
         ui::set_surface_builder(Rc::new(move |frame: &Frame, view: &ViewModel| {
-            render::surface(frame, &sink, &decoded, view)
+            render::surface(frame, &decoded, view)
         }));
 
         // 조각 빌더 — `<Raw>` 슬롯(타이틀바/툴바/레일/상태 띠/안내/단축키)이 같은 함수를 부른다.
@@ -286,12 +296,67 @@ impl Component for Shell {
 }
 
 impl Shell {
-    // ── ① → ② (포인터) ──────────────────────────────────────────────
+    // ── ① → ② (태블릿 표본) ─────────────────────────────────────────
 
-    /// 포인터 한 점 — ①이 pt로 바꾸고 ②가 잉크로 만든다.
-    fn pointer(&mut self, phase: Phase, x: f64, y: f64, frame: Option<input::PointerFrame>) {
-        let sample = input::sample_with(phase, x, y, self.canvas.scale(), frame);
+    /// 태블릿이 보낸 한 묶음 — ②가 잉크로 만들고, 다음 묶음을 여기서 **다시 건다**.
+    ///
+    /// 묶음 하나 = 메시지 하나다(400 Hz에서 초당 400개). 그리는 일은 표본당 O(1)이므로
+    /// 이 정도는 UI 스레드가 감당한다(R1) — 대신 **표본 사이의 일은 하지 않는다**.
+    fn tablet(&mut self, batch: otd::Batch, context: &ComponentContext<Self>) {
+        if let Some(spec) = batch.spec {
+            // 태블릿 범위를 알았다 — 이제 좌표를 페이지로 옮길 수 있다.
+            self.tablet = Some(spec);
+            self.status = format!(
+                "Tablet: {}",
+                self.tablet.as_ref().expect("방금 넣었다").name
+            );
+        }
+        if let Some(live) = batch.live {
+            self.otd = Some(live);
+        }
+        if batch.problem.is_some() {
+            self.otd_problem = batch.problem;
+        }
 
+        if !batch.samples.is_empty() {
+            self.otd_count += batch.samples.len() as u64;
+            let mut events: Vec<input::Sample> = Vec::new();
+            if let (Some(tablet), Some(feed)) = (self.tablet.clone(), self.feed.as_mut()) {
+                // 페이지 크기가 바뀌었을 수 있다(페이지 추가·이동·창 크기) — 매 묶음 맞춘다.
+                feed.retarget(&tablet, self.canvas.page_size());
+                let now = Instant::now();
+                for sample in &batch.samples {
+                    feed.push(sample, now, &mut events);
+                }
+            } else if self.tablet.is_none() {
+                // 범위를 모르면 좌표를 옮길 수 없다 — 이유는 배지가 말한다.
+            } else {
+                let tablet = self.tablet.clone().expect("위에서 확인했다");
+                self.feed = Some(Feed::new(&tablet, self.canvas.page_size()));
+            }
+            for event in events {
+                self.pen(event);
+            }
+        }
+
+        // 다음 묶음을 기다린다 — **여기가 스트림이 계속 도는 이유**다(자기 재예약).
+        self.wait_for_samples(context);
+    }
+
+    /// 스트림에서 다음 묶음을 받아 메시지로 만든다 — 묶음 하나마다 **다시 건다**.
+    ///
+    /// 통로는 **복제**를 넘긴다(실패에서 배웠다): 수신자를 클로저로 옮기면 첫 묶음 뒤에 다시
+    /// 기다릴 수 없어 화면이 그 자리에서 멈춘다.
+    fn wait_for_samples(&mut self, context: &ComponentContext<Self>) {
+        let stream = self.stream.clone();
+        let _ = context.spawn_background(move |_cancel| {
+            // 짧게 끊는다: 리액터의 백그라운드 풀을 오래 붙들면 ④-워커의 베이크가 밀린다.
+            HostMessage::Tablet(stream.next(Duration::from_millis(50)))
+        });
+    }
+
+    /// 펜 표본 하나 — ①이 이미 페이지 pt로 옮겼고 ②가 잉크로 만든다.
+    fn pen(&mut self, sample: input::Sample) {
         // **필기 정책**: 시작과 진행은 디지타이저(펜)만 한다. 손가락·마우스는 무시한다 —
         // 취소하지 않는 이유는 손바닥이 닿았다고 진행 중인 펜 획을 버리면 안 되기 때문이다.
         // 끝(`is_end`)은 장치와 무관하게 전달한다: 커밋할 제스처는 펜이 시작한 것뿐이다.
@@ -356,25 +421,16 @@ impl Shell {
     /// 필기가 아닌 입력 — **아무것도 만들지 않고** 이유를 상태바에 남긴다.
     ///
     /// 진행(`Moved`)마다 쓰면 상태바가 시끄러우므로 **시작(`Pressed`)에서만** 말한다.
+    /// 지금 표본을 만드는 곳은 태블릿 하나뿐이라 여기까지 오는 표본은 없지만, 정책은 남는다:
+    /// 다른 입력원이 붙어도 잉크가 되는 장치는 펜뿐이다.
     fn reject(&mut self, sample: input::Sample) {
         if sample.phase != Phase::Pressed {
             return;
         }
-        let state = digitizer::state();
-        self.status = if !state.is_hooking() {
-            // 훅이 안 걸렸으면 **그것이** 필기가 안 되는 이유다 — 정직하게 말한다.
-            state.reason().to_string()
-        } else if digitizer::seen_pen() {
-            format!(
-                "{} input — this app only inks with a pen (digitizer)",
-                sample.device().label()
-            )
-        } else {
-            format!(
-                "{} input — this app only inks with a pen (digitizer), and no pen has been detected yet",
-                sample.device().label()
-            )
-        };
+        self.status = format!(
+            "{} input — this app only inks with a pen",
+            sample.device().label()
+        );
     }
 
     /// 펜으로 시작한 획의 한 줄 — **필압이 오는지**를 화면에서 확인할 수 있게.
@@ -386,14 +442,23 @@ impl Shell {
         }
     }
 
-    /// 입력 배지 — "무엇으로 그리는 중인가"를 머리글에 **항상** 띄운다.
+    /// 입력 배지 — "지금 무엇으로 그리는가"를 머리글에 **항상** 띄운다.
     ///
-    /// 필기가 안 될 때 사용자가 원인을 알 수 있는 유일한 단서라서, 상태 문구(마지막으로
-    /// 한 일)와 **따로** 둔다: 훅이 안 걸렸는지 / 펜이 아직 안 왔는지 / 펜이 오는지.
+    /// 필기가 안 될 때 사용자가 원인을 알 수 있는 유일한 단서라서 상태 문구(마지막으로 한 일)와
+    /// **따로** 둔다. 문장은 진단 표와 **같은 값**에서 나온다(두 곳이 다른 말을 하면 안 된다).
     fn input_badge(&self) -> String {
-        // 배지의 문장은 진단 표와 **같은 값**에서 나온다(두 곳이 다른 말을 하면 안 된다).
-        let digest = digitizer::digest();
-        digitizer::input_badge(digest.state, digest.seen_pen, digest.messages, digest.mouse)
+        match &self.otd {
+            // 살아 있고 범위까지 알면 필기가 되는 상태다.
+            Some(live) if live.alive && self.tablet.is_some() => format!(
+                "Tablet — {:.0} samples/s ({} skipped)",
+                self.otd_rate, live.skipped
+            ),
+            Some(_) if self.tablet.is_some() => {
+                "Tablet connected — the plugin stopped reporting".to_string()
+            }
+            Some(_) => "Tablet connected — reading the tablet range…".to_string(),
+            None => "No tablet — OpenTabletDriver is not sending samples".to_string(),
+        }
     }
 
     // ── ② 명령 (elm 의도) ───────────────────────────────────────────
@@ -463,9 +528,12 @@ impl Shell {
             // **개발자 도구** — 여는 것만 한다(표는 다음 발행에서 채워진다: `view_model`).
             Intent::ToggleDev => self.dev = !self.dev,
             Intent::Rescan => {
-                // 창을 **다시 찾는다**: 늦게 생긴 자식 창(콘텐츠 창)을 줍는 길이다.
-                digitizer::rescan();
-                self.status = "Rescanned windows for pen input".to_string();
+                // 공유 메모리와 태블릿 범위를 **다시 찾는다** — 플러그인을 방금 설치했거나
+                // 데몬을 다시 띄웠을 때 쓴다.
+                if let Some(kick) = &self.kick {
+                    kick.kick();
+                }
+                self.status = "Reconnecting to OpenTabletDriver…".to_string();
             }
             Intent::GoToPage(index) => {
                 // 레일에서 고른 페이지 — 페이지 이동은 접두사를 무효로 만든다(③이 안다).
@@ -504,8 +572,21 @@ impl Shell {
 
     // ── ③ → ④ (한 프레임) ───────────────────────────────────────────
 
+    /// 초당 표본 수를 잰다 — 반 초마다 갱신한다(상태줄·배지·진단이 읽는다).
+    ///
+    /// 표본 수를 그대로 보여주는 것보다 **초당**이 유용하다: 펜을 대면 400쯤, 떼면 0이다.
+    fn measure_rate(&mut self) {
+        let elapsed = self.otd_mark.1.elapsed();
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
+        self.otd_rate = (self.otd_count - self.otd_mark.0) as f32 / elapsed.as_secs_f32();
+        self.otd_mark = (self.otd_count, Instant::now());
+    }
+
     /// ③ 꼬리를 맞추고, 필요하면 ④-워커에 **한 건** 맡긴다. UI 스레드는 여기서 멈추지 않는다.
     fn refresh(&mut self, context: &ComponentContext<Self>) {
+        self.measure_rate();
         self.canvas.refresh(self.tool.drawing());
         if !self.canvas.needs_bake(self.baking.is_some()) {
             return;
@@ -570,16 +651,52 @@ impl Shell {
 
     /// 개발자 도구에 올릴 **진단 표** — 문장은 여기서 만든다(조각은 표만 그린다).
     ///
-    /// 첫 줄은 WinUI 쪽 사실이다: 디지타이저 훅이 죽어 있어도 **표면에는 이벤트가 온다** —
-    /// 그 수가 0이면 문제는 훅이 아니라 UI 경로다(둘을 가르는 유일한 근거).
+    /// 순서가 곧 원인 추적 순서다: ①공유 메모리를 열었는가 ②플러그인이 살아 있는가
+    /// ③태블릿 범위를 아는가 ④표본이 오는가 ⑤앱이 못 따라간 적이 있는가.
     fn diagnostics(&self) -> Vec<(String, String)> {
-        let digest = digitizer::digest();
-        let last = digest.last.map_or("none", |frame| frame.device.label());
-        let mut rows = vec![(
-            "WinUI pointer events".to_string(),
-            format!("{} (last device frame: {last})", self.ui_events.get()),
-        )];
-        rows.extend(digest.report());
+        let samples = match &self.otd {
+            Some(live) => format!("{} read ({} written)", self.otd_count, live.write_seq),
+            None => format!("{} read (no ring yet)", self.otd_count),
+        };
+        let mut rows = vec![
+            (
+                "Shared memory".to_string(),
+                match &self.otd {
+                    Some(live) if live.alive => "open — plugin alive".to_string(),
+                    Some(_) => "open — plugin is not reporting alive".to_string(),
+                    None => "not found — install OTD.SharedMemoryOutput and restart the daemon"
+                        .to_string(),
+                },
+            ),
+            (
+                "Tablet".to_string(),
+                match &self.tablet {
+                    Some(spec) => format!(
+                        "{} — X {} Y {} P {}",
+                        spec.name, spec.max_x, spec.max_y, spec.max_pressure
+                    ),
+                    None => "unknown — the range comes from the OTD RPC".to_string(),
+                },
+            ),
+            ("Samples".to_string(), samples),
+            ("Rate".to_string(), format!("{:.0}/s", self.otd_rate)),
+            (
+                // **이 수가 멈추면 스트림 스레드가 멈춘 것**이다(표본이 0인 이유를 가른다).
+                "Polls".to_string(),
+                self.otd
+                    .as_ref()
+                    .map_or_else(|| "0".to_string(), |live| live.ticks.to_string()),
+            ),
+            (
+                "Skipped".to_string(),
+                self.otd
+                    .as_ref()
+                    .map_or_else(|| "0".to_string(), |live| live.skipped.to_string()),
+            ),
+        ];
+        if let Some(problem) = &self.otd_problem {
+            rows.push(("Problem".to_string(), problem.clone()));
+        }
         rows
     }
 }

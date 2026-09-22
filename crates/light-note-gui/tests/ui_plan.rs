@@ -43,7 +43,7 @@ fn view(tool: Tool, stage: Stage) -> ViewModel {
         pdf_name: String::new(),
         stage,
         status: "Untitled · page 1 / 1 · 0 strokes".to_string(),
-        input: "Pen — digitizer active".to_string(),
+        input: "Tablet — 400 samples/s (0 skipped)".to_string(),
         help: false,
         dev: false,
         diag: Vec::new(),

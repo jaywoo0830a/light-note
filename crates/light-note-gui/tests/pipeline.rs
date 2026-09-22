@@ -1,7 +1,7 @@
 //! 4단계 파이프라인 계약 — **WinUI 없이** 돈다(WinUI는 창을 띄우는 일만 한다).
 //!
 //! 여기서 고정하는 것:
-//! - ① 표본 정규화(표면 DIP → pt)와 위상
+//! - ① 표본(태블릿 → 페이지 pt)과 위상 — 호버·접촉·이탈·스트림 끊김
 //! - ② 드래그 하나 = 편집 하나, 취소는 아무것도 남기지 않는다, 지우개는 되돌릴 수 있다
 //! - ③ 꼬리는 **구운 접두사 뒤에서 시작**하고, 베이크는 예산이 정하며, 낡은 응답은 버려진다 (R1·R2·R3)
 
@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 
 use light_note_gui::canvas::{Canvas, LIVE_SHAPE_BUDGET};
 use light_note_gui::doc::Edit;
-use light_note_gui::geom::{Pt, Scale, Size};
+use light_note_gui::geom::{Pt, Size};
 use light_note_gui::ink::{InkPoint, Rgba, Style, Tool};
-use light_note_gui::input::{self, Device, Phase, PointerFrame, FRAME_TTL_MS};
+use light_note_gui::input::{self, Device, Phase};
+use light_note_gui::otd::shm::{PenSample, FLAG_ERASER, FLAG_OUT_OF_RANGE, FLAG_TIP};
+use light_note_gui::otd::{Feed, TabletSpec};
 use light_note_gui::render;
 use light_note_gui::tool::CanvasTool;
 
@@ -51,130 +53,162 @@ fn bake_now(canvas: &mut Canvas) -> bool {
     canvas.accept(result).unwrap_or(false)
 }
 
-// ── ① HardwareInput ─────────────────────────────────────────────────
+// ── ① HardwareInput (OTD) ───────────────────────────────────────────
 
-#[test]
-fn stage1_normalizes_surface_dip_to_points() {
-    // 배율 100% = 1pt당 1.5px (Windows 11 기본).
-    let sample = input::sample(Phase::Pressed, 150.0, 300.0, Scale::from_zoom(100.0));
-    assert_eq!(sample.at, Pt::new(100.0, 200.0));
-    assert_eq!(sample.phase, Phase::Pressed);
+/// 실측한 태블릿 — 이 PC의 XP-Pen Deco 01 V3 (Variant 2).
+fn deco() -> TabletSpec {
+    TabletSpec {
+        name: "XP-Pen Deco 01 V3 (Variant 2)".to_string(),
+        max_x: 51196.0,
+        max_y: 31826.0,
+        max_pressure: 16383.0,
+    }
+}
 
-    // 배율을 올리면 같은 DIP가 더 작은 pt가 된다.
-    let zoomed = input::sample(Phase::Moved, 150.0, 300.0, Scale::from_zoom(200.0));
-    assert_eq!(zoomed.at, Pt::new(50.0, 100.0));
+/// 공유 메모리에서 온 표본 하나 — 계약(`otd::shm`)대로 만든다.
+fn pen_sample(x: f32, y: f32, pressure: f32, flags: u32) -> PenSample {
+    PenSample {
+        seq: 1,
+        x,
+        y,
+        pressure,
+        tilt: None,
+        eraser: flags & FLAG_ERASER != 0,
+        buttons: 0,
+        contact: flags & FLAG_TIP != 0,
+        out_of_range: flags & FLAG_OUT_OF_RANGE != 0,
+    }
+}
+
+/// 표본 흐름 하나 — 태블릿 범위와 페이지 크기로.
+fn feed() -> Feed {
+    Feed::new(&deco(), Size::A4)
 }
 
 #[test]
-fn stage1_two_cancel_paths_are_one_phase() {
-    // `capture_lost`와 `canceled`는 둘 다 Canceled로 온다.
-    assert!(Phase::Canceled.is_end());
-    assert!(Phase::Released.is_end());
-    assert!(!Phase::Pressed.is_end());
-    assert!(!Phase::Moved.is_end());
-}
+fn stage1_contact_is_what_makes_a_stroke() {
+    // 표본 → 위상: 호버는 아무것도 아니고, 닿으면 시작, 떼면 끝이다.
+    let mut feed = feed();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    feed.push(&pen_sample(1000.0, 1000.0, 0.0, 0), now, &mut out);
+    assert!(out.is_empty(), "호버는 표본이 아니다");
 
-#[test]
-fn stage1_a_pen_frame_brings_pressure_and_tilt() {
-    // ①은 하드웨어 프레임을 **버리지 않고** 들고 온다 — 장치·필압·틸트가 표본에 붙는다.
-    let frame = PointerFrame::new(Device::Pen, Some(0.5), Some((12.0, -30.0)), Instant::now());
-    let sample = input::sample_with(
-        Phase::Pressed,
-        150.0,
-        300.0,
-        Scale::from_zoom(100.0),
-        Some(frame),
+    feed.push(&pen_sample(1000.0, 1000.0, 4000.0, FLAG_TIP), now, &mut out);
+    feed.push(&pen_sample(2000.0, 1000.0, 5000.0, FLAG_TIP), now, &mut out);
+    feed.push(&pen_sample(2000.0, 1000.0, 0.0, 0), now, &mut out);
+    assert_eq!(
+        out.iter().map(|sample| sample.phase).collect::<Vec<_>>(),
+        vec![Phase::Pressed, Phase::Moved, Phase::Released]
     );
-    assert_eq!(sample.at, Pt::new(100.0, 200.0), "좌표 변환은 그대로다");
-    assert_eq!(sample.device(), Device::Pen);
-    assert_eq!(sample.pressure(), Some(0.5));
-    assert_eq!(sample.tilt(), Some((12.0, -30.0)));
-    assert!(sample.is_ink(), "펜만 잉크가 된다");
-}
-
-#[test]
-fn stage1_only_a_digitizer_makes_ink() {
-    // 손가락은 필기가 아니다 — 그리고 프레임이 없으면 장치를 모르는 입력, 곧 마우스다.
-    let touch = PointerFrame::new(Device::Touch, None, None, Instant::now());
-    let touched = input::sample_with(
-        Phase::Pressed,
-        0.0,
-        0.0,
-        Scale::from_zoom(100.0),
-        Some(touch),
-    );
-    assert_eq!(touched.device(), Device::Touch);
-    assert!(!touched.is_ink(), "손가락은 잉크를 만들지 않는다");
-    assert_eq!(touched.pressure(), None, "터치에는 필압이 없다");
-
-    let bare = input::sample(Phase::Pressed, 0.0, 0.0, Scale::from_zoom(100.0));
-    assert_eq!(bare.device(), Device::Mouse, "WM_POINTER가 없으면 마우스다");
-    assert!(!bare.is_ink(), "마우스는 잉크를 만들지 않는다");
-}
-
-#[test]
-fn stage1_a_stale_frame_is_dropped() {
-    // 펜을 떼고 온 표본에 펜 압력(과 "펜이다"라는 자격)이 붙으면 둘 다 거짓이다.
-    let then = Instant::now() - Duration::from_millis(FRAME_TTL_MS + 1);
-    let old = PointerFrame::new(Device::Pen, Some(0.9), None, then);
-    let sample = input::sample_with(Phase::Moved, 10.0, 10.0, Scale::from_zoom(100.0), Some(old));
-    assert_eq!(sample.frame, None, "TTL 밖의 프레임은 버린다");
-    assert_eq!(sample.pressure(), None);
     assert!(
-        !sample.is_ink(),
-        "낡은 펜 프레임으로 마우스를 필기로 만들지 않는다"
+        out.iter().all(|sample| sample.is_ink()),
+        "표본은 전부 펜이다"
     );
+    // 좌표는 **이미 페이지 pt**다 — 창 크기(DIP)는 여기에 관여하지 않는다.
+    assert!(out
+        .iter()
+        .all(|sample| sample.at.x <= Size::A4.width + 0.01));
 }
 
 #[test]
-fn stage1_win32_pen_values_keep_their_contract() {
-    // Win32 계약: 압력 0~1024 → 0.0~1.0, 틸트 -90~90도.
-    assert_eq!(input::pressure_from_raw(0), 0.0);
-    assert_eq!(input::pressure_from_raw(512), 0.5);
-    assert_eq!(input::pressure_from_raw(1024), 1.0);
-    assert_eq!(input::pressure_from_raw(u32::MAX), 1.0, "범위 밖은 자른다");
-    assert_eq!(input::tilt_from_raw(-90), -90.0);
-    assert_eq!(input::tilt_from_raw(0), 0.0);
-    assert_eq!(input::tilt_from_raw(120), 90.0);
-    // 회전은 0~359도(시계 방향) — 범위 밖은 한 바퀴로 접는다.
-    assert_eq!(input::rotation_from_raw(0), 0.0);
-    assert_eq!(input::rotation_from_raw(90), 90.0);
-    assert_eq!(input::rotation_from_raw(359), 359.0);
-    assert_eq!(input::rotation_from_raw(360), 0.0);
+fn stage1_pressure_and_tilt_come_from_the_tablet() {
+    // 필압은 **장치가 보고한 값**을 장치의 최대값으로 나눈 것이다(1024가 아니다).
+    let mut feed = feed();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    let mut pressed = pen_sample(1000.0, 1000.0, 16383.0, FLAG_TIP);
+    pressed.tilt = Some((12.5, -30.0));
+    feed.push(&pressed, now, &mut out);
+    assert_eq!(out[0].pressure(), Some(1.0));
+    assert_eq!(out[0].tilt(), Some((12.5, -30.0)));
+    assert_eq!(out[0].device(), Device::Pen);
+
+    // 범위 밖의 필압도 잉크 폭은 0~1이다(장치가 이상한 값을 보내도).
+    let mut clamped = Vec::new();
+    feed.push(
+        &pen_sample(1100.0, 1000.0, 999_999.0, FLAG_TIP),
+        now,
+        &mut clamped,
+    );
+    assert_eq!(clamped[0].pressure(), Some(1.0));
+}
+
+#[test]
+fn stage1_leaving_the_tablet_ends_the_stroke() {
+    // 범위 이탈은 좌표가 무효다 — 진행 중 획을 **커밋**하는 신호다(버리지 않는다).
+    let mut feed = feed();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    feed.push(&pen_sample(1000.0, 1000.0, 4000.0, FLAG_TIP), now, &mut out);
+    out.clear();
+    feed.push(&pen_sample(0.0, 0.0, 0.0, FLAG_OUT_OF_RANGE), now, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].phase, Phase::Released);
+    assert_eq!(out[0].pressure(), Some(0.0), "떨어진 펜은 필압이 없다");
 }
 
 #[test]
 fn stage1_a_flipped_pen_says_so() {
-    // `PEN_FLAG_INVERTED`는 프레임의 **자세**로 온다 — ②가 그 자세를 정책으로 바꾼다(지우기).
-    let flipped = PointerFrame::new(Device::Pen, Some(0.5), None, Instant::now()).with_pen_pose(
-        true,
-        true,
-        Some(90.0),
+    // 지우개 비트는 프레임의 **자세**로 온다 — ②가 그 자세를 정책으로 바꾼다(지우기).
+    let mut feed = feed();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    feed.push(
+        &pen_sample(1000.0, 1000.0, 4000.0, FLAG_TIP | FLAG_ERASER),
+        now,
+        &mut out,
     );
-    let sample = input::sample_with(
-        Phase::Pressed,
-        0.0,
-        0.0,
-        Scale::from_zoom(100.0),
-        Some(flipped),
-    );
-    assert!(sample.inverted(), "뒤집힘은 프레임이 들고 온다");
-    assert!(sample.is_ink(), "뒤집힌 펜도 **펜**이다(자격은 그대로)");
-    assert_eq!(sample.pressure(), Some(0.5), "뒤집혀도 필압은 필압이다");
-    assert_eq!(flipped.rotation, Some(90.0));
-    assert!(flipped.has_eraser, "지우개 끝의 유무는 장치의 능력이다");
+    assert!(out[0].inverted(), "뒤집힘은 프레임이 들고 온다");
+    assert!(out[0].is_ink(), "뒤집힌 펜도 **펜**이다(자격은 그대로)");
+    assert_eq!(out[0].pressure(), Some(4000.0 / 16383.0));
 
-    // 뒤집히지 않은 펜도, 장치를 모르는 입력도 뒤집힘이 아니다.
-    let plain = PointerFrame::new(Device::Pen, None, None, Instant::now());
-    let straight = input::sample_with(
-        Phase::Pressed,
-        0.0,
-        0.0,
-        Scale::from_zoom(100.0),
-        Some(plain),
+    // 뒤집히지 않은 펜은 뒤집힘이 아니다. 회전은 0.6.7에 리포트가 없어 언제나 `None`이다.
+    let mut straight = Vec::new();
+    feed.push(
+        &pen_sample(1000.0, 1000.0, 4000.0, FLAG_TIP),
+        now,
+        &mut straight,
     );
-    assert!(!straight.inverted());
-    assert!(!input::sample(Phase::Pressed, 0.0, 0.0, Scale::from_zoom(100.0)).inverted());
+    assert!(!straight[0].inverted());
+    assert_eq!(straight[0].frame.expect("프레임").rotation, None);
+}
+
+#[test]
+fn stage1_only_a_pen_makes_ink() {
+    // 손가락·마우스는 잉크가 아니다(정책은 ②에 있다). 그리고 표본을 만드는 곳이 태블릿
+    // 하나뿐이라 **그런 표본은 아예 생기지 않는다** — 그래도 판정은 남는다.
+    assert!(CanvasTool::accepts(Device::Pen));
+    assert!(!CanvasTool::accepts(Device::Touch));
+    assert!(!CanvasTool::accepts(Device::Mouse));
+    let bare = input::Sample {
+        phase: Phase::Pressed,
+        at: Pt::new(10.0, 10.0),
+        now: Instant::now(),
+        frame: None,
+    };
+    assert_eq!(
+        bare.device(),
+        Device::Mouse,
+        "프레임이 없으면 장치를 모른다"
+    );
+    assert!(!bare.is_ink());
+}
+
+#[test]
+fn stage1_a_broken_stream_cancels() {
+    // 플러그인이 사라졌다 — 반쪽 획을 문서에 남기지 않는다(커밋하지 않는다).
+    let mut feed = feed();
+    let now = Instant::now();
+    let mut out = Vec::new();
+    feed.push(&pen_sample(1000.0, 1000.0, 4000.0, FLAG_TIP), now, &mut out);
+    out.clear();
+    feed.finish(now, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].phase, Phase::Canceled);
+    assert!(Phase::Canceled.is_end());
+    assert!(Phase::Released.is_end());
+    assert!(!Phase::Pressed.is_end() && !Phase::Moved.is_end());
 }
 
 // ── ② CanvasTool ────────────────────────────────────────────────────
