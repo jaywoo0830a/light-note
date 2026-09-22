@@ -35,6 +35,14 @@
 //! | `pointerInfo.pointerFlags` | ✅ `POINTER_FLAG_INCONTACT` — 호버 갱신은 **프레임이 아니다** |
 //! | `pointerInfo.historyCount` | ❌ 안 쓴다 — 아래 한계 참고 |
 //!
+//! ## OTD 같은 드라이버와 함께 쓸 때
+//! 원시 입력 장치 목록(`GetRawInputDeviceList`, HID 사용 페이지 `0x0D`)을 읽어 **Windows가 아는
+//! 디지타이저**를 표에 보여준다 — 이름이 곧 **어느 드라이버가 펜을 내보내는가**다(예: VMulti의
+//! `VirtualHID`, VID `0x00FF`/PID `0xBACC`). 그리고 창마다 **마우스 메시지 수**도 센다: 펜을
+//! **마우스로** 내보내는 출력 모드(예: OpenTabletDriver의 기본 Absolute/Relative Mode =
+//! `SendInput`)는 `WM_POINTER`를 **하나도** 만들지 않으므로, 그 경우 표는 `pen 0 · mouse N`이라고
+//! 정확히 말한다(그때는 그 드라이버에서 Windows Ink 계열 출력 모드를 골라야 한다).
+//!
 //! ## 한계 (정직하게)
 //! - **점이 뭉쳐 오면 최신 하나만** 쓴다: 문서는 "처리가 못 따라가면 메시지가 합쳐지니
 //!   `GetPointerPenInfoHistory`를 쓰라"고 말한다. 지금은 합쳐진 갱신에서 **마지막 점**만 취하므로
@@ -185,6 +193,54 @@ impl Digitizer {
     }
 }
 
+/// Windows가 아는 **디지타이저 장치 하나** — 이름과 용도(원시 입력 장치 목록에서 읽는다).
+///
+/// 이 목록이 중요한 이유: `WM_POINTER`는 **OS가 펜 장치를 알 때만** 나온다. 그래서 "펜이 안 잡힌다"는
+/// 문제는 두 갈래로 갈린다 — ① OS가 펜을 아예 모른다(장치 목록이 비었다), ② OS는 아는데 펜을
+/// **마우스로** 내보내는 드라이버다(`WM_POINTER`는 안 나오고 마우스 메시지만 온다).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PenDevice {
+    /// 장치 경로에서 사람이 읽는 부분만 남긴 이름(예: `hid vid_00ff&pid_bacc`).
+    pub name: String,
+    /// 디지타이저 페이지의 용도 — 펜(0x02)과 손가락(0x04·0x05)은 **다른 장치**다.
+    pub usage: u16,
+}
+
+/// HID 사용 페이지의 용도(usage) 이름 — 디지타이저 페이지(0x0D)의 값들이다.
+///
+/// 순수 함수다: 표에 어떤 말이 나가는지 화면 없이 검증한다.
+pub fn usage_label(usage: u16) -> &'static str {
+    match usage {
+        0x01 => "digitizer",
+        0x02 => "pen",
+        0x03 => "light pen",
+        0x04 => "touch screen",
+        0x05 => "touch pad",
+        0x06 => "white board",
+        0x07 | 0x08 => "3D digitizer",
+        _ => "digitizer device",
+    }
+}
+
+/// 원시 입력 장치 경로를 **사람이 읽는 이름**으로 줄인다.
+///
+/// `\\?\hid#vid_00ff&pid_bacc&mi_00#7&5b1c#0000#{4d1e55b2-...}` → `hid vid_00ff&pid_bacc&mi_00`.
+/// 앞 두 조각(버스 + VID/PID, 그리고 있으면 `mi_xx` **인터페이스**)만 남긴다: 그게 **어떤 장치인지**를
+/// 말하는 부분이고, 나머지(인스턴스 번호·GUID)는 꽂을 때마다 달라진다. `mi_xx`를 남기는 이유는
+/// 같은 VID/PID의 장치가 **인터페이스마다 다른 용도**로 나타나기 때문이다(디지타이저 + 마우스 등).
+///
+/// 순수 함수다 — 줄이는 규칙이 곧 진단 표의 문장이므로 화면 없이 검증한다.
+pub fn compact_device_name(path: &str) -> String {
+    let body = path.split("#{").next().unwrap_or(path);
+    let body = body.trim_start_matches("\\\\?\\");
+    let mut parts = body.split('#');
+    let head = parts.next().unwrap_or_default();
+    match parts.next() {
+        Some(ids) if !ids.is_empty() => format!("{head} {ids}"),
+        _ => head.to_string(),
+    }
+}
+
 /// 창 하나의 **관측 기록** — 어느 창으로 입력이 오는가를 눈으로 보기 위한 것.
 ///
 /// WinUI 3의 창은 하나가 아니다: 최상위 앱 창과 그 안의 자식 콘텐츠 창이 따로 있다. 창마다
@@ -207,6 +263,10 @@ pub struct Probe {
     pub messages: u32,
     /// 그중 **펜**이었던 수.
     pub pen: u32,
+    /// 이 창이 받은 **마우스** 메시지 수(`WM_MOUSEMOVE`·`WM_LBUTTONDOWN`·`WM_LBUTTONUP`).
+    ///
+    /// 펜을 마우스로 내보내는 드라이버는 `WM_POINTER`를 만들지 않는다 — 그때 이 숫자만 움직인다.
+    pub mouse: u32,
 }
 
 impl Probe {
@@ -226,8 +286,8 @@ impl Probe {
         let visible = if self.visible { "visible" } else { "hidden" };
         let hooked = if self.hooked { "hooked" } else { "not hooked" };
         format!(
-            "{width}×{height} · {visible} · {hooked} · msgs {} · pen {}",
-            self.messages, self.pen
+            "{width}×{height} · {visible} · {hooked} · msgs {} · pen {} · mouse {}",
+            self.messages, self.pen, self.mouse
         )
     }
 }
@@ -241,6 +301,8 @@ pub struct Digest {
     pub seen_pen: bool,
     /// 모든 창을 합친 `WM_POINTER*` 메시지 수.
     pub messages: u32,
+    /// 모든 창을 합친 **마우스** 메시지 수 — 펜이 마우스로 오는 경우의 유일한 흔적이다.
+    pub mouse: u32,
     /// 찾은 창들(걸린 것과 못 걸린 것 모두).
     pub probes: Vec<Probe>,
     /// 마지막 펜 프레임.
@@ -249,6 +311,8 @@ pub struct Digest {
     pub last_age_ms: Option<u64>,
     /// 시스템 디지타이저.
     pub digitizer: Digitizer,
+    /// Windows가 아는 디지타이저 장치들(원시 입력 장치 목록) — 비어 있으면 OS가 펜을 모른다.
+    pub pen_devices: Vec<PenDevice>,
 }
 
 impl Digest {
@@ -261,6 +325,8 @@ impl Digest {
             ("Hook".to_string(), self.hook_summary()),
             ("Pen frames".to_string(), self.pen_summary()),
             ("WM_POINTER messages".to_string(), self.messages.to_string()),
+            ("Mouse messages".to_string(), self.mouse.to_string()),
+            ("Windows pen devices".to_string(), self.device_summary()),
             ("Last frame".to_string(), self.frame_summary()),
         ];
         if self.probes.is_empty() {
@@ -274,6 +340,15 @@ impl Digest {
             rows.push((
                 "Hint".to_string(),
                 "ink needs a pen digitizer — mouse and touch never draw".to_string(),
+            ));
+        }
+        // 펜 메시지는 없는데 **마우스**만 오고 있다면 그게 결론이다: 펜을 마우스로 내보내는 드라이버다.
+        if !self.seen_pen && self.mouse > 0 {
+            rows.push((
+                "Hint".to_string(),
+                "only mouse input arrives — OpenTabletDriver's Absolute/Relative Mode sends SendInput \
+                 mouse; choose the Windows Ink plugin or the Windows Pen Pointer output mode"
+                    .to_string(),
             ));
         }
         for probe in &self.probes {
@@ -305,6 +380,18 @@ impl Digest {
     }
 
     /// 마지막 프레임 한 줄 — 장치 · 필압 · 틸트 · 나이.
+    /// Windows가 아는 디지타이저들 — 이름이 곧 **어떤 드라이버가 펜을 내보내는가**다.
+    fn device_summary(&self) -> String {
+        if self.pen_devices.is_empty() {
+            return "none — Windows sees no digitizer device".to_string();
+        }
+        self.pen_devices
+            .iter()
+            .map(|device| format!("{} · {}", device.name, usage_label(device.usage)))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
     fn frame_summary(&self) -> String {
         let Some(frame) = self.last else {
             return "none yet".to_string();
@@ -340,10 +427,12 @@ pub fn digest() -> Digest {
         state: state(),
         seen_pen: seen_pen(),
         messages: MESSAGES.get(),
+        mouse: mouse(),
         probes: probes(),
         last,
         last_age_ms: last.map(|frame| frame.at.elapsed().as_millis() as u64),
         digitizer: DIGITIZER.get(),
+        pen_devices: pen_devices(),
     }
 }
 
@@ -371,9 +460,27 @@ fn probes() -> Vec<Probe> {
                 hooked: slot.hooked,
                 messages: slot.messages.get(),
                 pen: slot.pen.get(),
+                mouse: slot.mouse.get(),
             })
             .collect()
     })
+}
+
+/// 모든 창이 받은 **마우스** 메시지의 합 — 창 프로시저가 센 값을 그대로 더한다.
+fn mouse() -> u32 {
+    PROBES.with(|slots| slots.borrow().iter().map(|slot| slot.mouse.get()).sum())
+}
+
+/// Windows가 아는 디지타이저 장치들(원시 입력 장치 목록) — Windows 밖에서는 빈 목록이다.
+fn pen_devices() -> Vec<PenDevice> {
+    #[cfg(windows)]
+    {
+        win32::pen_devices()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 /// 스레드 로컬 원본 — 카운터가 `Cell`이라 **창 프로시저가 빌림 없이** 더한다.
@@ -386,6 +493,7 @@ struct Slot {
     hooked: bool,
     messages: Cell<u32>,
     pen: Cell<u32>,
+    mouse: Cell<u32>,
 }
 
 /// 앱 창을 찾아 서브클래스를 건다 — `view()`/`update()`가 매번 부른다(**공짜여야 한다**).
@@ -404,14 +512,19 @@ pub fn install() {
 #[cfg(windows)]
 mod win32 {
     use std::cell::Cell;
+    use std::mem::size_of;
     use std::time::Instant;
 
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::Pointer::{
         GetPointerInfo, GetPointerPenInfo, GetPointerType, POINTER_FLAG_INCONTACT, POINTER_INFO,
         POINTER_PEN_INFO,
+    };
+    use windows::Win32::UI::Input::{
+        GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICEINFO,
+        RIDI_DEVICENAME, RID_DEVICE_INFO, RIM_TYPEHID,
     };
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -419,11 +532,13 @@ mod win32 {
         GetWindowTextW, IsWindowVisible, NID_EXTERNAL_PEN, NID_INTEGRATED_PEN,
         NID_INTEGRATED_TOUCH, NID_READY, PEN_FLAG_ERASER, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE,
         PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH,
-        SM_DIGITIZER, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+        SM_DIGITIZER, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_POINTERDOWN, WM_POINTERUP,
+        WM_POINTERUPDATE,
     };
 
     use super::{
-        Device, Digitizer, HookState, Slot, DIGITIZER, LATEST, MESSAGES, PROBES, SEEN_PEN, STATE,
+        Device, Digitizer, HookState, PenDevice, Slot, DIGITIZER, LATEST, MESSAGES, PROBES,
+        SEEN_PEN, STATE,
     };
     use crate::input::{self, PointerFrame};
 
@@ -505,6 +620,7 @@ mod win32 {
                 hooked: false,
                 messages: Cell::new(0),
                 pen: Cell::new(0),
+                mouse: Cell::new(0),
             });
             Some((slots.len() - 1, false))
         })
@@ -578,6 +694,90 @@ mod win32 {
         }
     }
 
+    /// HID **사용 페이지**: 디지타이저(0x0D) — 펜은 이 페이지에서만 나온다.
+    const USAGE_PAGE_DIGITIZER: u16 = 0x0D;
+
+    /// Windows가 아는 **디지타이저 장치**들 — 원시 입력 장치 목록에서 사용 페이지 `0x0D`만 고른다.
+    ///
+    /// 여기 이름이 곧 **어떤 드라이버가 펜을 내보내는가**다: OEM 드라이버일 수도, OTD의 VMulti
+    /// 가상 디지타이저(`VirtualHID`, VID `0x00FF`/PID `0xBACC`)일 수도 있다. 목록이 비어 있으면
+    /// OS가 펜을 아예 모르는 것이고 — 그때는 `WM_POINTER`도 나오지 않는다.
+    pub(super) fn pen_devices() -> Vec<PenDevice> {
+        let size = size_of::<RAWINPUTDEVICELIST>() as u32;
+        let mut count = 0u32;
+        if unsafe { GetRawInputDeviceList(None, &mut count, size) } == u32::MAX || count == 0 {
+            return Vec::new();
+        }
+        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+        let listed = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size) };
+        if listed == u32::MAX {
+            return Vec::new();
+        }
+        list.truncate((listed as usize).min(list.len()));
+        list.iter().filter_map(pen_device).collect()
+    }
+
+    /// 한 장치가 **디지타이저**면 이름과 용도를 읽는다 — 아니면 `None`(마우스·키보드는 관심 없다).
+    fn pen_device(device: &RAWINPUTDEVICELIST) -> Option<PenDevice> {
+        if device.dwType != RIM_TYPEHID {
+            return None;
+        }
+        let mut info = RID_DEVICE_INFO {
+            cbSize: size_of::<RID_DEVICE_INFO>() as u32,
+            ..Default::default()
+        };
+        let mut size = size_of::<RID_DEVICE_INFO>() as u32;
+        let read = unsafe {
+            GetRawInputDeviceInfoW(
+                Some(device.hDevice),
+                RIDI_DEVICEINFO,
+                Some((&raw mut info).cast::<core::ffi::c_void>()),
+                &mut size,
+            )
+        };
+        if read == u32::MAX {
+            return None;
+        }
+        // 안전: `dwType`이 HID일 때만 `hid`가 채워진다 — 그 조건을 위에서 확인했다.
+        let hid = unsafe { info.Anonymous.hid };
+        if hid.usUsagePage != USAGE_PAGE_DIGITIZER {
+            return None;
+        }
+        Some(PenDevice {
+            name: device_name(device.hDevice),
+            usage: hid.usUsage,
+        })
+    }
+
+    /// 장치 경로(`\\?\hid#vid_...`)를 읽어 사람이 읽는 이름으로 줄인다.
+    fn device_name(handle: HANDLE) -> String {
+        // 문서의 계약: `pData == NULL`이면 반환값은 **0**이고, 필요한 크기는 `pcbSize`에 담긴다.
+        // 그리고 이 명령(`RIDI_DEVICENAME`)만 그 크기가 **문자 수**다(다른 명령은 바이트 수다).
+        let mut size = 0u32;
+        let _ = unsafe { GetRawInputDeviceInfoW(Some(handle), RIDI_DEVICENAME, None, &mut size) };
+        if size == 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; size as usize + 1];
+        let mut size = buffer.len() as u32;
+        let read = unsafe {
+            GetRawInputDeviceInfoW(
+                Some(handle),
+                RIDI_DEVICENAME,
+                Some(buffer.as_mut_ptr().cast::<core::ffi::c_void>()),
+                &mut size,
+            )
+        };
+        if read == u32::MAX {
+            return String::new();
+        }
+        let end = buffer
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(buffer.len());
+        super::compact_device_name(&String::from_utf16_lossy(&buffer[..end]))
+    }
+
     /// 창 프로시저 — `WM_POINTER*`를 **읽고 그대로 넘긴다**(입력을 소비하지 않는다).
     unsafe extern "system" fn pointer_proc(
         hwnd: HWND,
@@ -596,8 +796,22 @@ mod win32 {
             if message != WM_POINTERUPDATE || in_contact(id) {
                 record(data, id);
             }
+        } else if matches!(message, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+            // **펜이 안 오고 마우스만 오는 경우**를 세는 곳: 펜을 `SendInput` 마우스로 내보내는
+            // 드라이버(예: OpenTabletDriver의 기본 Absolute/Relative Mode)는 `WM_POINTER`를
+            // **하나도** 만들지 않는다. 이 숫자가 없으면 그 경우를 "아무 입력도 없다"로 오해한다.
+            count_mouse(data);
         }
         unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+
+    /// 이 창이 **마우스** 메시지를 받았다 — 펜이 마우스로 오는 드라이버의 유일한 흔적이다.
+    fn count_mouse(index: usize) {
+        PROBES.with(|slots| {
+            if let Some(slot) = slots.borrow().get(index) {
+                slot.mouse.set(slot.mouse.get().wrapping_add(1));
+            }
+        });
     }
 
     /// 접촉 중인가 — `POINTER_INFO.pointerFlags & POINTER_FLAG_INCONTACT`.

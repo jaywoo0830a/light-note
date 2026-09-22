@@ -387,6 +387,9 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app
 | 표면은 `<Raw>` **하나**로 붙고 재료가 그대로 도착 | `ui_plan::the_surface_reaches_the_registered_builder_through_one_raw_slot` |
 | 화면 언어는 **영어만** | `ui_plan::every_visible_string_is_english_only` |
 | 진단 표가 **세 관문**을 정확히 말한다(펜 유무·창별 도착 수·훅 상태) | `digitizer::*` |
+| 펜을 **마우스로** 내보내는 드라이버를 그렇게 말한다(`WM_POINTER 0` + 마우스 수, 거짓 조언 없음) | `digitizer::a_pen_sent_as_mouse_is_reported_as_such` |
+| 원시 입력 장치 이름을 읽어 **어떤 드라이버인지** 보여준다 | `digitizer::the_pen_device_list_names_the_driver` |
+| 장치 경로 줄이기와 용도 이름(펜/터치는 다른 장치) | `digitizer::device_names_and_usages_are_readable` |
 | Win32 펜 값의 계약(압력 0~1024·틸트 ±90·회전 0~359) | `pipeline::stage1_win32_pen_values_keep_their_contract` |
 | 프레임의 **자세**(뒤집힘·지우개 끝·회전)가 표에 그대로 나온다 | `digitizer::the_frame_line_reports_the_pen_pose` |
 | 뒤집힌 펜은 **그 제스처만** 지운다(도구 선택은 그대로) | `pipeline::stage2_a_flipped_pen_erases_without_changing_the_tool` |

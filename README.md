@@ -18,6 +18,28 @@
   (펜 하드웨어 · 훅이 걸린 창 · 도착한 펜 메시지)과 창마다의 도착 수를 표로 보고, 늦게 생긴 창을
   줍는 **Rescan**을 누를 수 있다(`digitizer::Digest`). 표는 `POINTER_PEN_INFO`의 자세까지 읽는다:
   **뒤집힘**(`PEN_FLAG_INVERTED`) · 지우개 끝의 유무 · 회전.
+- **드라이버 판별**: 표의 `Windows pen devices`는 원시 입력 장치 목록(사용 페이지 `0x0D`)에서 읽은
+  **Windows가 아는 디지타이저**다 — 이름이 곧 *어떤 드라이버가 펜을 내보내는가*다. `Mouse messages`와
+  함께 보면 "펜이 안 잡히는" 이유가 두 갈래로 갈린다: **OS가 펜을 모른다**(장치 목록이 비었다) vs
+  **펜을 마우스로 내보낸다**(`WM_POINTER 0` · `mouse N`, 아래 OTD 항목).
+
+### OpenTabletDriver(OTD)와 함께 쓸 때
+
+OTD는 **출력 모드가 펜을 어떻게 내보내는지**를 정한다 — 그게 이 앱이 펜을 보는지도 정한다.
+
+| OTD 출력 모드 | 펜을 어떻게 내보내나 | 이 앱이 보는가 |
+|---|---|---|
+| `Absolute Mode` / `Relative Mode` (내장 기본) | `SendInput` **마우스** | ❌ `WM_POINTER`가 **하나도** 안 온다 → 진단 표가 `pen 0 · mouse N` |
+| **`Windows Ink` 플러그인** (+ VMulti 드라이버) | VMulti **가상 HID 디지타이저**(VID `0x00FF`/PID `0xBACC`)를 `HidSharp`로 밀어 넣는다 — OS는 **진짜 펜**으로 본다 | ✅ `PT_PEN` · 필압 · 틸트 · 뒤집힘(`PEN_FLAG_INVERTED`) |
+| `Windows Pen Pointer` 플러그인 | `InjectSyntheticPointerInput`(`PT_PEN`) | ✅ 같은 경로(커널 드라이버 불필요) |
+| `VMultiMode`, `TouchEmu` 등 | VMulti 마우스/터치 | ⚠️ 펜이 아니면 잉크가 되지 않는다(정책) |
+
+- OTD 문서도 같은 말을 한다: *"OpenTabletDriver has no built-in support for pressure on Windows… Install
+  VMulti Driver / WindowsInk"* (`Wiki/FAQ/Windows`) 그리고 *"Vanguard blocks … SendInput API which
+  OpenTabletDriver uses in its Absolute Mode"* (`Wiki/FAQ/WindowsAppSpecific`) — 즉 **기본 모드는 마우스**다.
+- **확인법**: OTD에서 `Windows Ink`(또는 `Windows Pen Pointer`)를 출력 모드로 두고 이 앱의 진단 표를 열면
+  `Windows pen devices`에 `HID VID_00FF&PID_BACC… · pen`이 뜨고 창마다 `pen`이 오른다. `mouse`만 오르면
+  출력 모드가 **내장 기본**이라는 뜻이다(그때 표가 그렇게 말하도록 힌트 줄을 넣었다).
 - **펜을 뒤집으면 지운다**: `PEN_FLAG_INVERTED`가 켜진 동안의 제스처는 **그 제스처만** 지운다 —
   도구 선택은 안 바뀌므로 뒤집기를 풀면 고른 도구로 계속 그린다(지우는 규칙은 지우개 도구와 같다).
 
@@ -172,7 +194,7 @@ Border (루트: PDF 끌어놓기 — 공식 drag-drop 패턴)              app.r
 cargo test -p light-note-gui
 ```
 
-93개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
+97개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
 
 - `pipeline` — ①표본 정규화(표면 DIP → pt)·**펜 프레임**(장치·필압·틸트, 낡은 프레임은 버림)
   ②드래그 하나 = 편집 하나·취소는 흔적 없음·**펜만 필기**(마우스·손가락은 무시)·**필압이
