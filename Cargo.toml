@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/light-note-core", "crates/light-note-win"]
+members = ["crates/light-note-gui"]
 
 [workspace.package]
 version = "0.1.0"

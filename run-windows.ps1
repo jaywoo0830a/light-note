@@ -5,7 +5,7 @@
        "문자열에 종결자가 없습니다" 파싱 오류 5개가 쏟아진다(이 파일에서 실제로 겪었다 —
        파일 내용은 정상이었고 인코딩만 문제였다). 그래서 이 저장소는 **.ps1에만** BOM을 쓴다.
        지키는 것: `.editorconfig`(에디터가 저장할 때) · `.gitattributes`(CRLF) ·
-       `crates/light-note-core/tests/encoding.rs`(테스트가 검사).
+       `crates/light-note-gui/tests/encoding.rs`(테스트가 검사).
 .SYNOPSIS
     light-note를 윈도우 11에서 점검 → 테스트 → 빌드 → 실행한다.
 
@@ -24,23 +24,23 @@
          없으면 앱이 설치 안내 대화상자를 띄우고 `0x8007007E`로 죽는다.
 
     **리눅스/맥에서는 아무것도 빌드하지 않는다** — WinUI 층은 `cfg(windows)`라
-    컴파일 대상이 아니다. 그쪽에서는 `cargo test -p light-note-core`(계약 테스트 전부 —
+    컴파일 대상이 아니다. 그쪽에서는 `cargo test -p light-note-gui`(계약 테스트 전부 —
     인코딩 규칙 검사까지 포함).
 
     스크립트 없이 같은 일을 하는 명령(저장소 루트에서):
-        cargo test  -p light-note-core
-        cargo build -p light-note-win --release
-        cargo run   -p light-note-win --release
+        cargo test  -p light-note-gui
+        cargo build -p light-note-gui --release
+        cargo run   -p light-note-gui --release
 
     참고: 빌드된 exe는 **콘솔 하위 시스템**이라 창과 함께 콘솔도 뜬다(로그 확인용).
-    콘솔이 싫으면 `crates/light-note-win/src/main.rs`에
+    콘솔이 싫으면 `crates/light-note-gui/src/main.rs`에
     `#![cfg_attr(windows, windows_subsystem = "windows")]`를 추가한다.
 
 .PARAMETER Prereq
     전제조건만 점검하고 끝낸다(빌드하지 않는다).
 
 .PARAMETER Test
-    코어 계약 테스트만 돌린다(`cargo test -p light-note-core`).
+    계약 테스트만 돌린다(`cargo test -p light-note-gui`).
 
 .PARAMETER Check
     컴파일만 확인한다(`cargo check --workspace` — WinUI 호스트 포함).
@@ -119,7 +119,7 @@ $downloadsUrl = 'https://learn.microsoft.com/windows/apps/windows-app-sdk/downlo
 
 $profile = if ($DebugBuild) { 'debug' } else { 'release' }
 $profileFlag = if ($DebugBuild) { @() } else { @('--release') }
-$exeName = 'light-note-win.exe'
+$exeName = 'light-note-gui.exe'
 $exePath = Join-Path $root "target\$profile\$exeName"
 
 # ── 출력 도우미 ──────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ function Test-Prereq {
     if (-not $onWindows) {
         Write-Warn2 '이 스크립트는 윈도우 전용이다 (WinUI 3 / Windows App Runtime 필요).'
         Write-Warn2 '리눅스/맥에서는 WinUI 호스트가 컴파일되지 않는다.'
-        Write-Fix '리눅스/맥: cargo test -p light-note-core   (계약 테스트 전부 — 인코딩 규칙까지 돈다)'
+        Write-Fix '리눅스/맥: cargo test -p light-note-gui   (계약 테스트 전부 — 인코딩 규칙까지 돈다)'
         exit 2
     }
     Write-Ok "윈도우 $([System.Environment]::OSVersion.Version) / PowerShell $($PSVersionTable.PSVersion)"
@@ -317,8 +317,8 @@ if ($Clean) {
 }
 
 if ($Test) {
-    Invoke-Cargo -CargoArgs @('test', '-p', 'light-note-core')
-    Write-Host '코어 계약 테스트 통과 (UI 계약 + 인코딩 규칙)' -ForegroundColor Green
+    Invoke-Cargo -CargoArgs @('test', '-p', 'light-note-gui')
+    Write-Host '계약 테스트 통과 (파이프라인 · 화면 · 내보내기 · 인코딩 규칙)' -ForegroundColor Green
     exit 0
 }
 
@@ -328,12 +328,12 @@ if ($Check) {
     exit 0
 }
 
-# 기본 흐름: 코어 계약 → 빌드 → 실행
-Write-Step '코어 계약 테스트 (플랫폼 독립)'
-Invoke-Cargo -CargoArgs @('test', '-p', 'light-note-core')
+# 기본 흐름: 계약 테스트 → 빌드 → 실행
+Write-Step '계약 테스트 (파이프라인 · 화면 · 내보내기 · 인코딩)'
+Invoke-Cargo -CargoArgs @('test', '-p', 'light-note-gui')
 
-Write-Step "WinUI 호스트 빌드 ($profile)"
-Invoke-Cargo -CargoArgs (@('build', '-p', 'light-note-win') + $profileFlag)
+Write-Step "WinUI 앱 빌드 ($profile)"
+Invoke-Cargo -CargoArgs (@('build', '-p', 'light-note-gui') + $profileFlag)
 
 if (-not (Test-Path -LiteralPath $exePath)) {
     throw "빌드가 끝났는데 exe가 없다: $exePath"

@@ -955,22 +955,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "light-note-core"
+name = "light-note-gui"
 version = "0.1.0"
 dependencies = [
  "elm-magic",
  "elm-magic-windows-reactor",
  "hayro",
  "pdf-writer",
-]
-
-[[package]]
-name = "light-note-win"
-version = "0.1.0"
-dependencies = [
- "elm-magic",
- "elm-magic-windows-reactor",
- "light-note-core",
  "rfd",
  "windows-reactor",
 ]

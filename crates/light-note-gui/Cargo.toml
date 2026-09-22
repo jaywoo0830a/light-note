@@ -1,0 +1,22 @@
+[package]
+name = "light-note-gui"
+description = "light-note — 윈도우 11 전용 필기 앱 (elm-magic + windows-reactor, 4단계 렌더 파이프라인)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 윈도우 전용이다 — 리눅스/맥은 대상이 아니다.
+# 파이프라인(①입력 ②도구 ③캔버스 ④렌더)은 순수 로직이라 `cargo test`가 WinUI 없이 돈다.
+
+[dependencies]
+elm-magic.workspace = true
+elm-magic-windows-reactor.workspace = true
+hayro.workspace = true
+pdf-writer.workspace = true
+windows-reactor.workspace = true
+rfd.workspace = true
+
+[[bin]]
+name = "light-note-gui"
+path = "src/main.rs"

@@ -7,46 +7,101 @@
   `hayro`가 재수출하는 `vello_cpu`의 `Pixmap`(프리멀티플라이드 RGBA8)을 **배경과 잉크가
   함께 쓴다**. 쓰기는 `pdf-writer`(hayro-write와 같은 writer)라 내보낸 PDF를 다시 읽어
   검증할 수 있다.
-- **UI**: [`elm-magic`](https://crates.io/crates/elm-magic) 0.8.6 + `elm-magic-windows-reactor`
-  0.8.6 어댑터(선언적 WinUI 3, `windows-reactor` 0.100).
+- **UI**: [`elm-magic`](https://crates.io/crates/elm-magic) 0.8.7 + `elm-magic-windows-reactor`
+  0.8.7 어댑터(선언적 WinUI 3, `windows-reactor` 0.100). 파일 대화상자는 `rfd` 0.15.
 
-## 구조
+## 구조 — 크레이트 하나, 파이프라인 하나
 
 ```
-crates/light-note-core   플랫폼 독립 엔진 — 필기 모델/래스터/PDF 입출력/elm 화면
-crates/light-note-win    WinUI 3 호스트 — 윈도우 11 전용 (포인터/파일/표면)
+crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 ```
 
-| 모듈 | 하는 일 |
-|---|---|
-| `core::geom` | 좌표계 계약 (pt, **좌상단 원점**) |
-| `core::ink` | 도구/스타일/압력 샘플/스트로크 |
-| `core::doc` | 페이지·문서·진행 중인 획 |
-| `core::history` | **드래그 하나 = Undo 하나** |
-| `core::raster` | 스트로크 → 픽셀 (vello_cpu) |
-| `core::pdf` | hayro로 열기/크기/래스터화 (읽기 전용) |
-| `core::export` | PNG / PDF(벡터 잉크 + 배경 이미지) |
-| `core::surface` | WinUI 표면이 무엇을 그릴지 (정적 PNG + 라이브 도형) |
-| `core::ui` | elm-magic 화면 + 어댑터 계획(plan) 계약 |
+엔진과 호스트를 나누지 **않는다**: 좌표·기하·문서·표면이 전부 같은 `Pixmap`과 같은 도형
+결정을 공유하는데, 크레이트를 가르면 그 계약이 `pub` 경계를 넘느라 문장이 길어지고
+(테스트도 두 곳으로 갈라지고) 경계를 넘는 값이 실제로 늘었다. 지금은 **모듈**로 나누고
+`cargo test`가 WinUI 없이 돈다(WinUI 타입은 `render`/`app`/`files`에만 있다).
 
-## 테스트 (리눅스에서 전부 돈다)
+| 모듈 | 단계 | 하는 일 |
+|---|---|---|
+| `geom` | — | 좌표계 계약(pt, **좌상단 원점**), 배율(pt↔px), 선분 거리 |
+| `ink` | — | 도구·스타일·압력 표본·스트로크(샘플 필터, 히트 테스트) |
+| `doc` | — | 페이지·문서·편집 기록(Undo/Redo) — **진행 중 획은 여기 없다** |
+| `input` | ① | WinUI 포인터(DIP) → 표본(`Pt` + 위상), O(1) |
+| `tool` | ② | 표본 → 획·지우개, press/drag/lift/cancel, 속도→압력 |
+| `canvas` | ③ | 문서 + **구운 접두사** + **안 구운 꼬리**, 베이크 요청(latest-wins) |
+| `render` | ④ | `Frame` → WinUI 트리(키 diff), 베이크(워커), 가속키 |
+| `ui` | ④ | elm-magic 화면(`Screen`/`InkSurface`) + `<Raw>` 경계 |
+| `shape` | ④ | **도형 하나를 정하는 곳** — 래스터·라이브·PDF가 모두 여기를 쓴다 |
+| `pdf` | 밖 | hayro로 PDF 열기/크기/래스터화(읽기 전용) |
+| `export` | 밖 | PNG / PDF(벡터 잉크 + 배경 이미지) |
+| `files` | 밖 | 네이티브 파일 대화상자(IFileDialog) |
+| `app` | 셸 | 4단계를 **순서대로 부르는 유일한 곳**(elm `Component`, 워커) |
+
+## 4단계 파이프라인
+
+```text
+① HardwareInput  [UI]    WinUI 포인터 → Sample              (input)
+② CanvasTool     [UI]    Sample → 획 + 라이브 기하            (tool)
+③ Canvas         [UI]    상태만: 획 목록 · 구운 접두사 · 꼬리   (canvas)
+④ Render         [UI]    Canvas → WinUI 트리(키 diff)        (render)
+                 [워커]  Canvas 스냅샷 → 픽스맵 + PNG          ← 페이지 크기 작업은 여기서만
+```
+
+규칙은 셋뿐이고, 그 셋이 이 앱의 설계 전부다:
+
+- **R1 — UI 단계는 페이지 크기에 비례하는 일을 하지 않는다.**
+  표본 하나는 O(1)이고, ④-UI가 만드는 도형 수는 `canvas::LIVE_SHAPE_BUDGET`(900)으로 묶인다.
+  예산을 넘으면 ③이 **베이크를 요청**한다. (측정: 600점 획의 라이브 기하는 **0.1ms**.)
+- **R2 — 픽셀 작업은 ④-워커에서만, 그리고 기다리지 않는다.**
+  요청은 **최신 하나**만 의미가 있다(`Canvas::last_request`, latest-wins).
+  UI 스레드는 결과를 기다리며 멈추지 않는다 — 늦게 온 응답은 **버린다**.
+- **R3 — 화면은 언제나 "구운 접두사 + 안 구운 꼬리"로 완전하다.**
+  접두사가 낡아도(지우개·되돌리기·페이지 이동) 꼬리가 그 획들을 그리므로 화면이 비지 않는다.
+  그래서 **타이머도, 세대 장부도, 안전망 스레드도 없다** — 예전 설계에 있던 그 셋을
+  규칙 하나가 대신한다.
+
+단계별 코드 경로·비용·불변식은 [docs/stroke-pipeline.md](docs/stroke-pipeline.md)에 정리했다.
+
+## 테스트 (WinUI 없이 전부 돈다)
 
 ```bash
-cargo test -p light-note-core
+cargo test -p light-note-gui
 ```
 
-74개 테스트가 **UI 계약과 인코딩 규칙까지** 검증한다(윈도우에서도 그대로 돈다):
+53개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
 
-- `ink_model` — 샘플 필터/필압/경계/지우개 히트 테스트
-- `document` — Undo/Redo(지우개 드래그 = 편집 하나), 페이지 관리, 취소
-- `raster` — 잉크가 **어디에** 올라갔는지 픽셀로 확인, 결정성, PNG 왕복
-- `export` — 내보낸 PDF를 **hayro로 다시 읽어** 배경/잉크 위치까지 검증
-- `ui_plan` — 버튼 → 의도 매핑, 상태 분기(로딩/빈/준비/실패), `<Raw>` 표면 전달
-- `surface` — 정적 레이어가 **언제** 바뀌는가(백그라운드 렌더의 꼬리 규칙, 더블 버퍼의
-  스테이징/승격, 빈 레이어 = 1×1 투명 PNG), 그리고 **라이브 도형이 래스터 잉크와 같은
-  영역을 덮는가**(픽셀 비교 — 승격 순간에 잉크가 바뀌지 않는 근거)
+- `pipeline` — ①표본 정규화(표면 DIP → pt) ②드래그 하나 = 편집 하나·취소는 흔적 없음
+  ③꼬리는 **구운 접두사 뒤에서 시작**·낡은 응답은 버려짐·예산이 상한 ④화면 계획
+- `geometry` — **라이브 도형과 래스터가 같은 픽셀인가**(곡선/가변폭/점/형광펜 4종, 바이트
+  비교), 관절을 덮는 확장 규칙, 관절에서 알파가 두 번 곱해지지 않는가
+- `document` — Undo/Redo(지우개 드래그 = 편집 하나, 페이지 편집도 한 편집), 히스토리 한계,
+  지우개 판정(선분 거리 + 획 반폭)
+- `export` — 내보낸 PDF를 **hayro로 다시 읽어** 페이지 수/크기를 검증, PNG 배경 합성,
+  파일 이름 규칙, 배경 페이지가 없으면 **조용히 넘어가지 않고 실패**
+- `ui_plan` — 버튼 18개 → 의도 매핑, 상태 분기(빈/준비/여는 중/실패), 상태바, `<Raw>` 경계가
+  **정확히 하나**이고 등록된 빌더에 재료가 그대로 도착하는가
 - `encoding` — `.ps1`의 **UTF-8 BOM**, 모든 텍스트 파일의 UTF-8/CRLF 계약
   (Windows PowerShell 5.1이 BOM 없는 `.ps1`을 ANSI로 읽어 파싱이 죽던 사고의 재발 방지)
+
+## 계측 — 숫자를 바꾸기 전에 먼저 재라
+
+```bash
+cargo run --release -p light-note-gui --example bake_cost
+```
+
+A4(893×1263px, 1.13Mpx) 기준 release 실측(개발 PC):
+
+| 재는 것 | 값 |
+|---|---|
+| 베이크 1획 (래스터+PNG) | **11.5ms** |
+| 베이크 20획 / 300획 | 14.0ms / **28.8ms** |
+| 그 안쪽: 잉크 래스터 / **PNG 인코딩** | 2.1ms / **14.3ms** |
+| 라이브 기하 600점 (UI 스레드) | **0.1ms** |
+| `Canvas::frame` / `Frame` 복사 (매 프레임) | **0.0ms**(`Rc` 복사) |
+
+읽는 법: **베이크의 80%가 PNG 인코딩**이다(A4 전체를 도는 비용) → 그래서 워커로 뺐고(R2),
+UI가 하는 일은 꼬리 도형 몇 개뿐이다(R1). `-DebugBuild`(opt-level 0)는 20배 느리다 —
+필기감을 판단할 때는 `--release`로 돌려라.
 
 ## 인코딩 규칙 (윈도우 최적화)
 
@@ -66,9 +121,10 @@ cargo test -p light-note-core
 
 - `.editorconfig` — 에디터가 **저장하는 순간** `.ps1`은 `utf-8-bom`, 나머지는 `utf-8`로 쓴다.
 - `.gitattributes` — 줄바꿈을 각 PC의 `core.autocrlf`가 아니라 저장소가 정한다(텍스트=CRLF).
-- `crates/light-note-core/tests/encoding.rs` — 실제 바이트를 검사한다(BOM·UTF-8·NUL·CRLF).
-  `run-windows.ps1`이 **가장 먼저** 돌리는 `cargo test -p light-note-core`에 포함되므로,
-  같은 사고는 스크립트를 돌리는 순간 바로 잡힌다.
+- `crates/light-note-gui/tests/encoding.rs` — 실제 바이트를 검사한다(BOM·UTF-8·NUL·CRLF).
+  `run-windows.ps1`이 **가장 먼저** 돌리는 `cargo test -p light-note-gui`에 포함되므로,
+  같은 사고는 스크립트를 돌리는 순간 바로 잡힌다. (`Cargo.lock`만 예외다 — cargo가 소유하고
+  `\n`으로 다시 쓰므로 우리 줄바꿈 계약의 대상이 아니다.)
 
 새 `.ps1`을 만들 때:
 
@@ -87,7 +143,7 @@ Set-Content -LiteralPath .\new.ps1 -Encoding utf8BOM -Value $text   # 5.1/7 공�
 ## 실행 (윈도우 11)
 
 ```powershell
-# 전제조건 점검 → 코어 계약 테스트 → 릴리스 빌드 → 실행 (한 번에)
+# 전제조건 점검 → 계약 테스트 → 릴리스 빌드 → 실행 (한 번에)
 powershell -ExecutionPolicy Bypass -File .\run-windows.ps1
 
 # 전제조건만 / 테스트만 / 컴파일만 / 빌드만
@@ -100,8 +156,8 @@ powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Build
 스크립트 없이 직접:
 
 ```powershell
-cargo test  -p light-note-core
-cargo run   -p light-note-win --release
+cargo test  -p light-note-gui
+cargo run   -p light-note-gui --release
 ```
 
 ### 전제조건 (`run-windows.ps1`이 직접 확인한다)
@@ -113,83 +169,74 @@ cargo run   -p light-note-win --release
 | Visual Studio Build Tools (C++ 도구, `link.exe`) | `winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
 | **Windows App Runtime 2.4** (`Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe`) | `-InstallRuntime`(winget) 또는 `-OpenDownloads` — [다운로드](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) |
 
-마지막 항목은 `windows-reactor` 0.100의 `bootstrap_runtime()`이 요구하는 것이다
-(`src/native/winui/bootstrap.rs`의 `FRAMEWORK_FAMILY` / 버전 상수 = 2.4). 없으면 앱이
+마지막 항목은 `windows-reactor` 0.100의 `bootstrap_runtime()`이 요구하는 것이다. 없으면 앱이
 설치 안내 대화상자를 띄우고 `0x8007007E`로 죽는다 — 스크립트가 미리 잡아 준다.
 
 ## Windows 11 최적화 포인트
 
-1. **확정 레이어 = PNG 한 장** — 드래그가 *끝날 때만* 다시 만든다(`InkSurface` 계약).
-2. **그 PNG는 백그라운드에서 만든다** — A4 한 장이 13ms(release)/277ms(dev)이고 그 80%가
-   PNG 인코딩이다. 포인터 메시지 처리 안에서 돌리면 **획을 끝낼 때마다 화면이 멈춘다**.
-   그래서 UI 스레드는 워커에 맡기고, 도착 전까지 방금 확정한 획을 라이브 도형으로 그려
-   빈 틈을 메운다(`surface::pending_ink`). 낡은 렌더 결과는 **세대 번호**로 버리고,
-   렌더 중에 또 그으면 작업을 다음 한 번으로 합친다(한 번에 하나만 돈다).
-3. **정적 레이어는 두 장(더블 버퍼) — 깜빡임이 구조적으로 없다** —
-   `Image.Source`를 바꾸면 어댑터(`windows-reactor` 0.100)는 **먼저 소스를 비우고** 그 다음
-   비동기로 디코드한다(`SetSourceAsync` → 끝나면 `SetSource` + `ImageOpened`). 그래서
-   한 장만 쓰면 그 사이 잉크가 **통째로 사라진다**(매 획마다 깜빡임).
-   지금은 새 PNG를 **창 밖으로 밀어 둔 뒤 레이어**에 올리고, 디코드가 끝났다는
-   신호를 받은 뒤에만 앞뒤를 바꾼다(`surface::StaticLayers`). 신호가 끝내 오지 않아도
-   화면이 멈추지 않도록 **150ms 안전망**을 함께 건다(그 사이 화면은 옛 레이어 + 라이브 꼬리).
-   화면의 잉크는 **한 프레임도 비지 않는다**.
-4. **라이브 도형은 래스터와 *같은 도형*이다 — 승격 순간에 모양이 바뀌지 않는다** —
-   라이브 레이어는 WinUI `Line`(직선)으로만 그릴 수 있는데, 래스터의 곡선과 다른 도형을
-   쓰면 획을 확정하는 순간(라이브 → PNG 승격) 잉크가 "딱" 바뀐다. 그래서 도형 결정을
-   [`raster::ink_shape`] **하나**로 모으고, 래스터도 라이브와 **같은 폴리라인**으로 채운다:
-   - 곡선(폭 일정) → 같은 중점 2차 베지어를 같은 오차(0.25px)로 편다(`raster::flatten_spans`).
+1. **추가는 베이크를 부르지 않는다** — 획 하나를 확정하는 일(`commit`)은 접두사를 낡게 하지
+   않는다. 그 획은 **꼬리**로 들어가고, 화면은 키가 바뀐 그룹 하나만 다시 그린다(키 diff).
+   지우개·되돌리기·페이지 이동처럼 **픽셀에서 뺄 수 없는 편집**만 베이크를 부른다(R3).
+2. **그 베이크는 워커에서 돈다** — A4 한 장 베이크는 11.5ms(1획)~28.8ms(300획)이고 그 80%가
+   **PNG 인코딩**이다. 포인터 메시지 처리 안에서 돌리면 화면이 멈춘다 — 그래서 UI 스레드는
+   워커에 맡기고, 도착 전까지 꼬리가 그 획들을 그려 빈 틈을 메운다. 워커에 가 있는 요청은
+   **최신 하나만** 의미가 있고(`last_request`), 낡은 응답은 조용히 버려진다(R2).
+3. **베이스는 두 장(더블 버퍼) — 깜빡임이 구조적으로 없다** — `Image.Source`를 바꾸면
+   어댑터(`windows-reactor` 0.100)는 **먼저 소스를 비우고** 그다음 비동기로 디코드한다
+   (`SetSourceAsync` → 끝나면 `SetSource` + `ImageOpened`). 그래서 한 장만 쓰면 그 사이 잉크가
+   **통째로 사라진다**. 지금은 새 PNG를 **창 밖으로 밀어 둔 뒤 자리**에 넣고, 디코드 완료
+   신호를 받은 뒤에만 앞뒤를 맞바꾼다(`Base::stage`/`promote`). 각 자리가 **자기 페이지·배율·
+   획 수**를 기억하므로, 그 사이 페이지가 바뀌면 대기 중 그림을 그냥 버린다. 예전에 있던
+   **150ms 안전망 타이머는 없다** — 꼬리가 항상 완전하므로(R3) 타이머가 메울 틈이 없다.
+4. **라이브 도형은 래스터와 *같은 도형*이다 — 확정 순간에 모양이 바뀌지 않는다** —
+   라이브 레이어는 WinUI `Line`(직선)으로만 그릴 수 있는데, 래스터의 곡선과 다른 도형을 쓰면
+   획을 확정하는 순간(라이브 → PNG 승격) 잉크가 "딱" 바뀐다. 그래서 도형 결정을
+   `shape::ink_shape` **하나**로 모으고, 래스터도 라이브와 **같은 폴리라인**으로 채운다:
+   - 곡선(폭 일정) → 같은 중점 2차 베지어를 같은 오차(0.25px)로 편다(`shape::flatten_spans`).
    - 폭 가변 → 구간 사각형을 **반지름만큼 늘려** 관절의 둥근 조인을 덮는다
-     (`raster::extended_span` — 원은 변이 `r`인 정사각형에 내접한다 → 도형을 더 그릴 필요가 없다).
+     (`shape::extended_span` — 원은 변이 `r`인 정사각형에 내접한다 → 도형을 더 그릴 필요가 없다).
    - 양 끝은 **둥근 캡** — WinUI `Line`에는 캡 속성이 없어서 채운 `Ellipse`로 그린다.
-   테스트가 **픽셀로** 확인한다: 라이브 도형과 래스터 잉크의 차이 = **0.000%**(6가지 획).
+   - 태블릿 없이 점 하나를 찍으면 **점 하나**(원) — 래스터도 같은 원 하나를 채운다.
+   `geometry` 테스트가 **픽셀로** 확인한다: 라이브 도형과 래스터 잉크의 바이트 차이 = **0**.
 5. **한 획 = 한 번의 채움 = 한 합성 그룹** — 래스터는 한 획을 `fill_path` **한 번**으로
    채우므로 겹친 부분(관절·캡)이 두 번 곱해지지 않는다. 라이브 레이어도 자식 도형을
    불투명하게 그리고 **그룹 불투명도**(`Canvas.Opacity`)를 준다 — WinUI가 자식들을 먼저
    합성한 뒤 한 번만 투명도를 적용하므로 **형광펜이 얼룩지지 않는다**(예전에는 구간마다
    따로 스트로크해서 관절마다 알파가 90 → 149로 진해졌다).
-6. **포인터는 `Border`** — `windows-reactor` 0.100에서 포인터 이벤트는 `Border`에만 있다.
-   `Canvas`는 절대 좌표 배치, `Image`는 정적 레이어 전용이다.
-7. **입력은 메시지 큐를 거쳐** 처리된다(Reactor의 이벤트 FIFO) — elm의 "이벤트 = 할당"과 맞는다.
-
-비용은 **예제로 잰다** — 숫자를 바꾸기 전에 먼저 재라:
-
-```bash
-cargo run --release -p light-note-core --example surface_cost
-```
-
-정적 레이어(획 수별) / 그 안쪽(래스터·픽셀 스캔·PNG 인코딩) / 라이브 도형 / 뷰모델 생성
-시간을 한 번에 출력한다. **`-DebugBuild`(opt-level 0)는 20배 느리다** — 필기감을 볼 때는
-기본(릴리스)로 돌려라.
+6. **도형 수의 상한 = 900** — ④-UI가 그리는 도형 수는 `LIVE_SHAPE_BUDGET`(900)을 넘지 않는다.
+   넘으면 ③이 베이크를 요청하고, 그동안에도 화면은 완전하다(R1·R3). 긴 획 하나(600점)가 만드는
+   도형은 733개, 만드는 데 0.1ms다 — 상한은 "느려지면"이 아니라 **구조로** 지킨다.
+7. **포인터는 `Border`** — `windows-reactor` 0.100에서 포인터 이벤트는 `Border`에만 있다.
+   `Canvas`는 절대 좌표 배치, `Image`는 베이스 전용이다.
+8. **입력은 메시지 큐를 거쳐** 처리된다(Reactor의 이벤트 FIFO) — elm의 "이벤트 = 할당"과 맞는다.
 
 ## 알아둘 한계 (어댑터/런타임 사실)
 
-- **`Image.Source` 교체는 비동기다**: 어댑터는 소스를 **먼저 비우고**(`clear_property`)
-  `SetSourceAsync`로 디코드한 뒤 완료되면 붙이고 `ImageOpened`를 올린다. 그래서 표면은
-  **두 장(더블 버퍼)** 이고, 새 그림은 창 밖에 밀어 둔 뒤 레이어에서 디코드가 끝난 뒤에만
-  승격된다(`surface::StaticLayers`). 소스가 바뀐 레이어가 화면에 노출되는 경로가 없어야
-  깜빡임이 사라진다 — 이 규칙을 깨면 매 획마다 잉크가 번쩍인다.
+- **`Image.Source` 교체는 비동기다**: 어댑터는 소스를 먼저 비우고 `SetSourceAsync`로 디코드한
+  뒤 완료되면 붙이고 `ImageOpened`를 올린다. 그래서 베이스는 **두 장(더블 버퍼)** 이고, 새
+  그림은 창 밖 자리에 넣은 뒤 디코드가 끝난 뒤에만 승격된다(`render::surface` + `Base`).
+  소스가 바뀐 그림이 화면에 노출되는 경로가 없어야 깜빡임이 사라진다 — 이 규칙을 깨면 매
+  획마다 잉크가 번쩍인다.
 - **WinUI `Line`에는 캡/조인 속성이 없다**: `windows-reactor` 0.100이 노출하는 `Line` 속성은
   `Stroke`/`StrokeThickness`/`X1..Y2`뿐이다(`Path`·`Polyline`은 아예 없다). 그래서 둥근 캡은
   **채운 `Ellipse`**, 관절의 둥근 조인은 **구간 사각형을 반지름만큼 늘려** 흉내낸다
-  (`raster::extended_span` — 원은 변이 `r`인 정사각형에 내접하므로 늘린 사각형이 관절을 덮는다).
-  대신 관절 모서리가 `≈0.15r²`만큼 더 채워지는데, 눈에 띄지 않고 **래스터/PNG/PDF와 라이브가
-  같은 도형**이 되는 이득이 훨씬 크다(픽셀 차이 0.000%).
+  (`shape::extended_span`). 대신 관절 모서리가 `≈0.15r²`만큼 더 채워지는데, 눈에 띄지 않고
+  **래스터/PNG/PDF와 라이브가 같은 도형**이 되는 이득이 훨씬 크다(픽셀 차이 0).
 - **겹쳐 그리면 반투명 색이 진해진다**: 래스터는 한 획을 한 번의 채움으로 그리므로, 라이브
   레이어도 **한 획 = 한 합성 그룹**(`Canvas.Opacity` = 색의 알파, 자식 도형은 불투명)으로
   그려야 같은 색이 나온다. 이 규칙을 깨면 형광펜의 캡/관절만 진해진다.
 - **PDF 내보내기는 폭이 일정한 획을 진짜 베지어 곡선으로 긋는다**(화면 PNG는 라이브 레이어와
   같은 폴리라인 — 오차 0.25px). 벡터 문서에서는 곡선이 더 낫기 때문이고, 확대해도 각지지 않는다.
-  폭이 변하는 획은 화면과 **같은 합집합**(사각형 + 둥근 캡)을 한 번 채운다(관절 얼룩 없음).
-
+  폭이 변하는 획은 화면과 **같은 합집합**(늘린 사각형 + 둥근 캡)을 한 번 채운다(관절 얼룩 없음).
+- **배경에 없는 페이지를 가리키면 내보내기가 실패한다** — 조용히 흰 종이로 넘어가지 않는다.
+  이유를 말하고 멈추는 편이 "왜 빈 페이지가 나왔지"를 만드는 것보다 낫다.
 - **필압**: `PointerEventInfo`에 압력이 없어 **속도로 굵기를 만든다**(`pressure_from_speed`).
   펜 태블릿 압력은 어댑터가 이벤트를 확장해야 한다.
 - **단축키**: `AcceleratorKey`가 `R`, NumPad, `Add`/`Subtract`, `Enter`만 지원한다 →
-  `Ctrl+더하기/빼기`(줌), `Ctrl+Enter`(페이지 추가)만 붙였다. `Ctrl+Z` 등은 어댑터가
-  `ElmView` 핸들을 노출하면 `drive::dispatch_key`로 연결할 수 있다. 그래서 같은 동작을
+  `Ctrl+더하기/빼기`(줌), `Ctrl+Enter`(페이지 추가)만 붙였다. 그래서 같은 동작을
   **툴바 버튼**으로도 제공한다.
 - **`<Raw>` 클로저는 슬롯/props를 못 본다**(토큰이 그대로 삽입된다) — 표면 재료는 호스트가
-  `ui::stage_surface`로 넘기고 클로저가 꺼내 쓴다.
-- **콜백 prop은 렌더당 한 번만** 부를 수 있다(매크로가 `move` 클로저로 감싼다) →
-  버튼마다 prop을 하나씩 둔다.
+  `ui::stage_frame`으로 넘기고 클로저가 꺼내 쓴다. 표면은 `<Raw>` **하나**뿐이다.
+- **콜백 prop은 하나다**(`on_intent`) — 예전에는 버튼마다 18개를 두었고, 그 18개가 화면과
+  호스트를 잇는 계약의 전부였다. 지금은 `Intent` 하나가 그 계약이다.
 - **자식은 슬롯을 직접 쓰지 않는다** — 공유 값은 호스트가 소유하고 props + 콜백으로 내린다.
-
