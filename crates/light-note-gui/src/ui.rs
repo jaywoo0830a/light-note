@@ -61,18 +61,28 @@ impl Intent {
     /// 툴바의 **묶음** — 구분선이 들어갈 자리까지 정의에 담는다(플랫폼 무관).
     ///
     /// 그리는 것은 `parts::toolbar`, 검증은 `tests/ui_plan.rs`가 한다.
-    pub const TOOLBAR: [&'static [Intent]; 6] = [
+    ///
+    /// 페이지 조작(`PageAdd`/`PageRemove`)은 **여기 없다** — 목록 옆(레일)이 제자리이고,
+    /// 툴바가 12개를 넘으면 좁은 창(≈940 DIP)에서 오른쪽 버튼이 잘린다(실제로 겪었다).
+    pub const TOOLBAR: [&'static [Intent]; 5] = [
         &[Intent::Pen, Intent::Highlighter, Intent::Eraser],
         &[Intent::Thinner, Intent::Thicker],
         &[Intent::Undo, Intent::Redo, Intent::Clear],
         &[Intent::Open, Intent::ExportPng, Intent::ExportPdf],
-        &[Intent::PageAdd, Intent::PageRemove],
         &[Intent::ToggleHelp],
     ];
 
-    /// 레일의 **묶음** — 페이지 이동과 배율은 레일에 있다(목록 옆이 제자리다).
+    /// 레일의 **묶음** — 페이지 목록 옆이 제자리인 조작들.
+    ///
+    /// 첫 묶음은 페이지 이동·추가·삭제(목록 바로 아래), 둘째 묶음은 배율이다 —
+    /// 배율 줄은 사이에 현재 배율(%)이 끼므로 `parts::rail`이 순서대로 그린다.
     pub const RAIL: [&'static [Intent]; 2] = [
-        &[Intent::PagePrev, Intent::PageNext],
+        &[
+            Intent::PagePrev,
+            Intent::PageNext,
+            Intent::PageAdd,
+            Intent::PageRemove,
+        ],
         &[Intent::ZoomOut, Intent::ZoomIn],
     ];
 

@@ -77,6 +77,7 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 | ④-b | `ui::set_part_builder(parts::build)` + `ui::set_intent_sink(…)` + `ui::stage_view(view)` | 조각은 값·빌더·**의도 통로**가 다 있어야 그린다(버튼이 그 통로를 캡처한다) |
 | ④-c | `ui::set_surface_builder(… render::surface(frame, sink, decoded, view))` | 표면도 값(창 크기·단계)을 받는다 — 잉크 영역 높이와 빈 상태 안내가 그 안에 있다 |
 | ④-d | `context.on_window_size(…)` → `HostMessage::Resized` | 창 크기가 **잉크 영역 높이의 유일한 근거**다(elm 트리는 StackPanel뿐이라 높이가 안 묶인다) |
+| ④-e | `style::TOKENS` — 원시 스칼라(`BASE`=1rem · `UNIT`=`BASE/4` · `STEP`=`BASE×2`)의 파생만 쓴다 | 화면 코드에 숫자가 없어야 눈금이 하나가 된다. **글꼴은 지정하지 않는다** — 리액터에 `FontFamily` 통로가 없어 시스템 글꼴을 상속한다 |
 | ⑤ | `ScreenProps { view, on_intent }` → `ElmView<Screen>` → **루트 `Grid`에 가속기** | 호스트 → elm은 props, elm → 호스트는 **의도 하나**. 가속기는 포커스와 무관하게 창 전체에 걸린다 |
 
 그리고 elm이 `<Raw>`를 만나면(`ui.rs`):

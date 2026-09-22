@@ -14,40 +14,71 @@
 //!    고르므로 라이트/다크/고대비가 공짜로 따라온다(예제 25). 브랜드 색을 새로
 //!    만들면 테마를 따라가지 **않으므로** 만들지 않았다 — 이 앱은 시스템 색으로 충분하다.
 //!
-//! ## 폰트 — Google Sans Flex를 지금 쓸 수 없는 이유 (확인한 사실)
-//! - Google Fonts의 `<link rel="stylesheet">`는 **HTML/CSS 기법**이다. 이 앱은
-//!   네이티브 WinUI라서 CSS도 `<link>`도 없고, 그 태그를 넣을 자리가 아예 없다.
-//! - WinUI에서 글꼴은 `TextBlock.FontFamily`로 정한다. 그런데 `windows-reactor`
-//!   0.100의 `TextBlock`은 `font_size` / `font_weight` / `foreground` /
-//!   `text_wrapping` / `max_lines` / `text_trimming` /
-//!   `is_text_selection_enabled`만 노출하고 **`FontFamily`는 노출하지 않는다**
-//!   (`generated.rs`의 프로퍼티 목록에 없다 — 예제 22의 결론과 같다).
-//!   `ResourceOverrides`도 `Color`/`Thickness`/`CornerRadius`만 받는다(예제 21).
-//! - 그래서 **어댑터의 `<Raw>`로도 글꼴 패밀리는 바꿀 수 없다**. 폰트 파일을 설치해도
-//!   이름을 지정할 통로가 없으면 적용되지 않는다. 지금은 WinUI 기본 글꼴
-//!   (Windows 11의 `Segoe UI Variable`)을 쓰고, "타이포 시스템"은 예제 22대로
-//!   **크기 · 굵기 · 색 · 자름** 네 축으로 만든다([`Tokens`]의 `title`/`subtitle`/
-//!   `body`/`caption` + `parts`의 `FontWeight` + `TextTrimming`).
-//! - 실제로 적용하려면 **업스트림 변경**이 필요하다: `windows-reactor`의 `TextBlock`에
-//!   `font_family` 프로퍼티를 추가하고(`PropertyId`/`PropertyValue`/`native/winui`
-//!   매핑까지 함께), 그 뒤 `FontFamily("Google Sans Flex")`를 넘긴다. 폰트가 시스템에
-//!   설치돼 있어야 이름이 해석되며, 폰트 파일 배포는 OFL 1.1 조건을 따른다.
-//!   [`Tokens::FONT_FAMILY`]에 그 이름을 적어 두었다 — 통로가 생기면 한 곳만 고치면 된다.
+//! ## 글꼴 — **시스템 글꼴을 상속한다** (소스로 확인한 사실)
+//! WinUI에서 글꼴을 정하는 것은 `TextBlock.FontFamily`(=`ITextBlock::SetFontFamily`)다.
+//! 그런데 `windows-reactor` 0.100은 그 통로를 열지 않았다 — 확인한 세 가지:
+//!
+//! 1. **속성 계층**(`generated.rs`의 `TextBlock`): `text` / `text_wrapping` / `font_size` /
+//!    `font_weight` / `is_text_selection_enabled` / `max_lines` / `text_trimming` /
+//!    `foreground`뿐이고 **`font_family`가 없다**.
+//! 2. **리소스 재정의**(`element.rs`의 `ResourceValue`): `Color` / `Thickness` /
+//!    `CornerRadius` 세 가지뿐이다 — WinUI의 관용구(`ContentControlThemeFontFamily` 같은
+//!    테마 리소스를 덮어쓰기)도 쓸 수 없다.
+//! 3. **네이티브 계층**(`native/winui/bindings.rs`)에는 **있다**: `ITextBlock_Vtbl` ·
+//!    `ITextElement_Vtbl` · `IControl_Vtbl`에 `FontFamily`/`SetFontFamily` 슬롯이 있다.
+//!    즉 막고 있는 것은 COM이 아니라 **리액터의 속성 목록**이다.
+//!
+//! 그래서 이 앱은 글꼴을 **지정하지 않는다** — WinUI3 기본 테마의 글꼴을 그대로
+//! **상속**한다(Windows 11: `Segoe UI Variable`). 우회도 하지 않는다: `<Raw>`로도 안 되고
+//! (같은 속성 계층을 지난다), CSS의 `<link rel="stylesheet">`는 HTML 기법이라 네이티브
+//! 앱에 넣을 자리가 없다. 대신 타이포는 **크기 · 굵기 · 색 · 자름** 네 축으로만 만든다
+//! (예제 22) — [`Tokens::SCALE`]의 4단계와 `parts`의 `FontWeight`/`TextTrimming`이
+//! 계층의 전부다.
+//!
+//! [`Tokens::FONT_FAMILY`]에는 **상속 결과**를 적어 두었다(우리가 고른 값이 아니다) —
+//! 업스트림이 `font_family`를 열면 그 한 곳만 실제 지정으로 바꾸면 된다.
+//!
+//! ## 값의 계보 — 원시 스칼라 → 파생 (한 규칙으로만)
+//! 값을 손으로 고르지 않는다. **원시 스칼라 세 개**가 있고, 나머지는 전부 규칙 하나로
+//! 거기서 나온다:
+//!
+//! | 원시 스칼라 | 값 | 무엇의 기준인가 |
+//! |---|---|---|
+//! | [`Tokens::BASE`] | **16 DIP = 1rem** | 글자 크기 · 큰 고정 크기 |
+//! | [`Tokens::UNIT`] | `BASE / 4` = **4 DIP** | 간격(리듬) · 작은 면의 모서리 |
+//! | [`Tokens::STEP`] | `BASE × 2` = **32 DIP** | 큰 면의 모서리 (16 × 2n) |
+//!
+//! | 무엇 | 규칙 | 이 앱의 값 |
+//! |---|---|---|
+//! | 간격 | `UNIT × n` | 4 / 8 / 12 / 16 / 24 |
+//! | **작은 면**의 모서리 | `UNIT × n` | 4(컨트롤) · 8(카드) · 16(알약) |
+//! | **큰 면**의 모서리 | `STEP × n` | 32(종이 · 큰 패널) |
+//! | 글자 크기 | `BASE × SCALE[i]` | 28 / 20 / 16 / 12 |
+//! | 고정 크기 | `UNIT × n` 또는 `BASE × n` | 버튼 36 · 레일 256 · 미리보기 200×32 |
+//!
+//! 그래서 "이 숫자가 왜 이 값인가"의 답은 항상 **원시 스칼라 + 규칙**이다. 예를 들어
+//! 모서리는 면의 크기로 갈린다: 작은 면(버튼·배지·카드)은 4의 배수 눈금, 큰 면(종이처럼
+//! 창을 크게 차지하는 면)은 16 × 2n 눈금 — 큰 면이 작은 눈금을 쓰면 각이 서고,
+//! 작은 면이 큰 눈금을 쓰면 알약처럼 뭉개진다. `tests/style.rs`가 두 눈금을 확인한다.
 //!
 //! ## 규칙 (테스트가 고정한다)
 //! - 모든 간격은 **4 DIP의 배수**다(예제 23의 리듬) — `tests/style.rs`가 확인한다.
-//! - 글자 크기는 내림차순이다(`title > subtitle > body > caption`) — 예제 22.
+//! - 작은 면의 모서리는 4의 배수, 큰 면은 32(=16×2)의 배수다.
+//! - 글자 크기는 내림차순이고 전부 `BASE`의 배율이다(`display > title > body > caption`).
 //! - 화면 코드(`parts`/`ui`)에는 숫자가 없다 — 전부 토큰 이름이다.
 
 /// 화면이 쓰는 기하·타이포 토큰. **값은 여기 한 곳에만 있다.**
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
-    /// 카드·표면 모서리 반지름 (DIP).
+    /// **작은 면**의 모서리 반지름 (DIP) — 카드·레일·안내 카드. `UNIT`의 배수.
     pub radius: f64,
-    /// 컨트롤(버튼·배지) 모서리 반지름 (DIP).
+    /// 컨트롤(버튼·미리보기 상자) 모서리 반지름 (DIP). `UNIT`의 배수.
     pub control: f64,
-    /// 알약(pill) 반지름 — "높이보다 큰 값"이라는 관례를 토큰으로 둔다(예제 24).
+    /// 알약(pill) 반지름 — 높이의 절반보다 큰 값이면 WinUI가 절반으로 잘라 알약이 된다
+    /// (예제 24). `UNIT`의 배수.
     pub pill: f64,
+    /// **큰 면**의 모서리 반지름 (DIP) — 종이처럼 창을 크게 차지하는 면. `STEP`(=16×2)의 배수.
+    pub sheet: f64,
     /// 같은 묶음 안의 간격 (DIP).
     pub tight: f64,
     /// 요소 사이 간격 (DIP) — 툴바 그룹 안, 배지 사이.
@@ -58,11 +89,13 @@ pub struct Tokens {
     pub pad: f64,
     /// 종이 둘레의 책상 여백 (DIP) — 페이지가 창보다 클 때의 호흡.
     pub page: f64,
+    /// 기준 글자 크기 (DIP) — 타이포 계층의 **1rem**.
+    pub base: f64,
     /// 문서 제목 글자 크기 (DIP) — 타이포 4단계(예제 22).
     pub display: f64,
     /// 섹션 제목 글자 크기 (DIP).
     pub title: f64,
-    /// 본문 글자 크기 (DIP).
+    /// 본문 글자 크기 (DIP) — **1rem**.
     pub body: f64,
     /// 보조 설명 글자 크기 (DIP).
     pub caption: f64,
@@ -92,17 +125,64 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// 글꼴 패밀리 이름 — **지금은 쓰이지 않는다**(모듈 문서의 이유 참고).
+    /// 이 앱이 실제로 쓰는 글꼴 — **WinUI3 기본 글꼴의 상속 결과**다(Windows 11의 이름).
     ///
-    /// `windows-reactor`가 `FontFamily`를 노출하면 [`crate::parts`]가 이 값을 쓴다.
-    pub const FONT_FAMILY: &'static str = "Google Sans Flex";
+    /// 지정하는 코드는 **없다**: `windows-reactor` 0.100의 속성 계층에 `font_family`가
+    /// 없어서(모듈 문서의 확인 목록) 글꼴은 **시스템이 정한다**. 그래서 이 값은
+    /// "고른 글꼴"이 아니라 "상속 결과의 기록"이고, `tests/style.rs`가 그 사실을 고정한다 —
+    /// 업스트림이 통로를 열면 여기 한 곳만 실제 지정으로 바꾼다.
+    pub const FONT_FAMILY: &'static str = "Segoe UI Variable";
 
-    /// 간격 단위 — 모든 간격이 이 값의 배수다.
-    pub const UNIT: f64 = 4.0;
+    /// ── 원시 스칼라 ① ── 기준 글자 크기: **1rem = 16 DIP**.
+    ///
+    /// 글자 크기(× [`Tokens::SCALE`])와 큰 고정 크기(× n)의 기준이다.
+    pub const BASE: f64 = 16.0;
+
+    /// ── 원시 스칼라 ② ── 리듬 단위: `BASE / 4` = **4 DIP**.
+    ///
+    /// 간격과 **작은 면**의 모서리가 전부 이 배수다.
+    pub const UNIT: f64 = Self::BASE / 4.0;
+
+    /// ── 원시 스칼라 ③ ── 큰 면의 눈금: `BASE × 2` = **32 DIP**.
+    ///
+    /// 종이처럼 창을 크게 차지하는 면의 모서리는 이 값의 배수(16 × 2n)만 쓴다.
+    pub const STEP: f64 = Self::BASE * 2.0;
+
+    /// `UNIT`의 배수인가 — 간격과 작은 면의 모서리가 지켜야 하는 규칙.
+    pub fn is_unit_multiple(value: f64) -> bool {
+        (value / Self::UNIT).fract() == 0.0
+    }
+
+    /// `STEP`의 배수인가 — 큰 면의 모서리가 지켜야 하는 규칙(16 × 2n).
+    pub fn is_step_multiple(value: f64) -> bool {
+        value > 0.0 && (value / Self::STEP).fract() == 0.0
+    }
+
+    /// **작은 면**의 모서리 3단계 — 전부 `UNIT`의 배수여야 한다(테스트가 확인한다).
+    pub fn small_radii(&self) -> [f64; 3] {
+        [self.control, self.radius, self.pill]
+    }
+
+    /// 타이포 배율 — **본문 1rem을 기준**으로 한 네 단계(내림차순: [`Tokens::sizes`]와 같은 순서).
+    ///
+    /// 문서 제목(1.75rem) · 제목(1.25rem) · 본문(1rem) · 캡션(0.75rem).
+    /// 웹의 rem 관례와 같은 눈금이라 "16px 기준"이 문서 없이도 읽힌다.
+    pub const SCALE: [f64; 4] = [1.75, 1.25, 1.0, 0.75];
 
     /// 타이포 4단계 — 내림차순이어야 계층이 읽힌다(예제 22).
     pub fn sizes(&self) -> [f64; 4] {
         [self.display, self.title, self.body, self.caption]
+    }
+
+    /// 크기 ÷ 기준 — [`Tokens::SCALE`]과 같아야 한다(테스트가 맞춰 본다).
+    pub fn ratios(&self) -> [f64; 4] {
+        let base = self.base;
+        [
+            self.display / base,
+            self.title / base,
+            self.body / base,
+            self.caption / base,
+        ]
     }
 
     /// 간격 5단계 — 리듬의 정의를 코드로 옮긴 것(예제 23).
@@ -114,33 +194,54 @@ impl Tokens {
     pub fn is_rhythmic(&self) -> bool {
         self.steps()
             .iter()
-            .all(|step| (step / Self::UNIT).fract() == 0.0)
+            .all(|step| Self::is_unit_multiple(*step))
+    }
+
+    /// 화면의 **고정 크기** — 전부 `UNIT` 또는 `BASE`의 배수여야 한다(테스트가 확인한다).
+    pub fn fixed_sizes(&self) -> [f64; 7] {
+        [
+            self.control_h,
+            self.preview_w,
+            self.preview_h,
+            self.line_max,
+            self.status_h,
+            self.chrome_h,
+            self.content_min,
+        ]
     }
 }
 
 /// 이 앱의 토큰 — 화면 코드는 이 값만 본다(예제 30의 `guide()`와 같은 역할).
 ///
-/// 리듬: 4 / 8 / 12 / 16 / 24 DIP. 타이포: 26 / 15 / 13 / 11 DIP.
-/// 컨트롤: 아이콘 버튼 32×32 DIP, 레일 248 DIP, 상태바 28 DIP.
+/// **모든 값이 원시 스칼라의 파생이다**(모듈 문서의 계보 표): 오른쪽은 항상
+/// `UNIT × n`(간격·작은 면의 모서리·고정 크기) · `STEP × n`(큰 면의 모서리) ·
+/// `BASE × SCALE[i]`(글자) 중 하나다 — 여기서만 규칙을 읽으면 되고, 화면 코드는 이름만 본다.
 pub const TOKENS: Tokens = Tokens {
-    radius: 8.0,
-    control: 4.0,
-    pill: 999.0,
-    tight: 4.0,
-    gap: 8.0,
-    block: 12.0,
-    pad: 16.0,
-    page: 24.0,
-    display: 26.0,
-    title: 15.0,
-    body: 13.0,
-    caption: 11.0,
-    rail: 248.0,
-    control_h: 32.0,
-    preview_w: 200.0,
-    preview_h: 28.0,
-    line_max: 20.0,
-    status_h: 28.0,
-    chrome_h: 480.0,
-    content_min: 240.0,
+    // 리듬 — UNIT의 배수
+    tight: Tokens::UNIT * 1.0, // 4
+    gap: Tokens::UNIT * 2.0,   // 8
+    block: Tokens::UNIT * 3.0, // 12
+    pad: Tokens::UNIT * 4.0,   // 16
+    page: Tokens::UNIT * 6.0,  // 24
+    // 작은 면의 모서리 — UNIT의 배수
+    control: Tokens::UNIT * 1.0, // 4
+    radius: Tokens::UNIT * 2.0,  // 8
+    pill: Tokens::UNIT * 4.0,    // 16 (높이의 절반을 넘으면 알약)
+    // 큰 면의 모서리 — STEP(=BASE×2)의 배수
+    sheet: Tokens::STEP * 1.0, // 32
+    // 타이포 — BASE × 배율표
+    base: Tokens::BASE,                       // 16 = 1rem
+    display: Tokens::BASE * Tokens::SCALE[0], // 28
+    title: Tokens::BASE * Tokens::SCALE[1],   // 20
+    body: Tokens::BASE * Tokens::SCALE[2],    // 16
+    caption: Tokens::BASE * Tokens::SCALE[3], // 12
+    // 고정 크기 — UNIT 또는 BASE의 배수
+    rail: Tokens::BASE * 16.0,        // 256
+    control_h: Tokens::UNIT * 9.0,    // 36
+    preview_w: Tokens::UNIT * 50.0,   // 200
+    preview_h: Tokens::UNIT * 8.0,    // 32
+    line_max: Tokens::UNIT * 5.0,     // 20
+    status_h: Tokens::UNIT * 10.0,    // 40
+    chrome_h: Tokens::UNIT * 130.0,   // 520
+    content_min: Tokens::UNIT * 60.0, // 240
 };

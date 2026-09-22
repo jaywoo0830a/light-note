@@ -68,12 +68,16 @@ pub fn tool_button(active: bool, intent: Intent, sink: &IntentSink) -> View {
 }
 
 /// **정사각 아이콘 버튼** — 모든 아이콘 버튼이 지나는 길(모양이 갈라지지 않는다).
+///
+/// 크기를 **강제하지 않는다**: `width`/`height`를 주면 WinUI 기본 패딩(≈11,5 DIP)이 그 안에
+/// 안 들어가 **아이콘이 잘린다**(실제로 겪었다). 최소 크기만 주고 자연 크기로 두면
+/// 아이콘 + 패딩이 그대로 들어간다.
 fn square_button(style: ButtonStyle, intent: Intent, sink: &IntentSink) -> View {
     let sink = Rc::clone(sink);
     Button::new()
         .style(style)
-        .width(TOKENS.control_h)
-        .height(TOKENS.control_h)
+        .min_width(TOKENS.control_h)
+        .min_height(TOKENS.control_h)
         .automation_name(intent.label())
         .on_click(move || sink(intent))
         .content(SymbolIcon::new().symbol(symbol(intent)))
@@ -117,7 +121,7 @@ pub fn label_button(label: &str, intent: Intent, sink: &IntentSink) -> View {
     );
     Button::new()
         .style(ButtonStyle::Subtle)
-        .height(TOKENS.control_h)
+        .min_height(TOKENS.control_h)
         .automation_name(label)
         .on_click(move || sink(intent))
         .content(content)

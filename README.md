@@ -62,9 +62,11 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 - **정의는 플랫폼 무관**(`ui.rs`) — `Intent::TOOLBAR`/`Intent::RAIL`/`Intent::CHROME`가
   "어떤 의도가 어디에 있는가"를 들고 있고 `tests/ui_plan.rs`가 빠짐·중복·라벨을 검증한다.
   그리는 일만 WinUI가 한다.
-- **숫자와 색은 토큰 하나**(`style.rs`) — 간격은 4 DIP의 배수(4/8/12/16/24), 글자 크기는
-  내림차순 4단계, 색은 **테마 브러시 이름**이라 라이트/다크/고대비가 공짜로 따라온다.
-  규칙은 `tests/style.rs`가 고정한다.
+- **숫자와 색은 토큰 하나**(`style.rs`) — 값은 **원시 스칼라 세 개**에서만 나온다:
+  `BASE`(16 DIP = **1rem**) · `UNIT`(`BASE/4` = 4) · `STEP`(`BASE×2` = 32).
+  간격·작은 면의 모서리·고정 크기는 `UNIT × n`, 큰 면(종이)의 모서리는 `STEP × n`(16×2n),
+  글자 크기는 `BASE × 배율표`(1.75 / 1.25 / 1 / 0.75rem)다. 색은 **테마 브러시 이름**이라
+  라이트/다크/고대비가 공짜로 따라온다. 규칙은 `tests/style.rs`가 고정한다.
 - 창 자체의 스타일(테마·Mica 배경)은 호스트만 만질 수 있다(`app.rs`의 `WindowVisuals`).
 
 ### 레이아웃 (조각의 자리)
@@ -72,7 +74,7 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 ```text
 Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
 └ 앱바      제목 · 배경(PDF) · 배지(페이지/배율/입력/저장 안 됨)   parts/header.rs
-├ 툴바      아이콘 버튼 14개(5묶음) + 잉크 미리보기(색·굵기)      parts/toolbar.rs
+├ 툴바      아이콘 버튼 12개(5묶음) + 잉크 미리보기(색·굵기)      parts/toolbar.rs
 ├ 정보 띠   상태 문구 · 힌트 · 도구/획/파이프라인/배율            parts/status.rs
 ├ 본문 ┬ 레일  페이지 목록(줄을 누르면 이동) · 조작 · 배율        parts/rail.rs
 │      └ 종이  잉크 표면 (빈 상태 안내 / 스피너 / 실패 카드)      render.rs · parts/{paper,empty,loading,failure}.rs
@@ -89,6 +91,7 @@ Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
 | `Grid::columns()`(열 정의) + `Grid.Column` | ❌ 첫 열이 남은 폭을 다 먹어(무한 폭으로 측정) **둘째 열의 자식이 화면 밖으로** 나간다 |
 | `Grid` 한 셀 + 오른쪽 정렬 | ❌ 셀 폭이 0이라 자식이 **왼쪽 바깥**으로 밀린다 |
 | `RelativePanel` 정렬 attached property | ❌ 자식이 제자리에 남는다 |
+| `TextBlock`의 **글꼴 지정** | ❌ `font_family` 프로퍼티가 없다(네이티브 `ITextBlock_Vtbl`에는 슬롯이 있다) — **시스템 글꼴을 상속**한다 |
 | `ScrollViewer`의 높이 | ⚠️ 창 크기(`on_window_size`)를 내려주면 스크롤이 생긴다 — **추정값**(`TOKENS.chrome_h`)에 기댄다 |
 
 그래서 배치는 **줄을 나누는 것**으로만 하고(양 끝 정렬 대신 두 줄), 잉크 영역 높이는
@@ -99,14 +102,15 @@ Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
 `tests/ui_plan.rs::every_visible_string_is_english_only`가 비-ASCII 알파벳을 금지한다
 (`—`/`·`/`…` 같은 구두점은 허용).
 
-**폰트 — `Google Sans Flex`는 지금 적용할 수 없다**:
-Google Fonts의 `<link rel="stylesheet">`는 HTML/CSS 기법이라 네이티브 WinUI에는 넣을 자리가
-없고, WinUI에서 글꼴을 정하는 `TextBlock.FontFamily`를 `windows-reactor` 0.100이 **노출하지
-않는다**(`font_size`/`font_weight`/`foreground`/`text_wrapping`/`max_lines`/`text_trimming`만
-있다 — 예제 22의 결론). `ResourceOverrides`도 `Color`/`Thickness`/`CornerRadius`만 받는다.
-이름은 `style::Tokens::FONT_FAMILY`에 두었으니 업스트림이 `font_family`를 열면 그 한 곳만 쓰면
-된다. 지금은 WinUI 기본 글꼴(Windows 11의 `Segoe UI Variable`)로 두고, 타이포는
-**크기 · 굵기 · 색 · 자름** 네 축으로 만든다.
+**글꼴은 시스템 글꼴을 상속한다**(지정하지 않는다): WinUI에서 글꼴을 정하는 것은
+`TextBlock.FontFamily`인데 `windows-reactor` 0.100이 그 통로를 열지 않았다 —
+① 속성 계층(`generated.rs`의 `TextBlock`)에 `font_family`가 없고,
+② 리소스 재정의(`ResourceValue`)도 `Color`/`Thickness`/`CornerRadius`뿐이며,
+③ 네이티브 계층(`native/winui/bindings.rs`)의 `ITextBlock_Vtbl`/`ITextElement_Vtbl`/
+`IControl_Vtbl`에는 `FontFamily`/`SetFontFamily` 슬롯이 **있다**(막는 것은 COM이 아니라
+리액터의 속성 목록이다). 그래서 Windows 11에서는 WinUI3 기본 글꼴(`Segoe UI Variable`)이
+그대로 쓰이고, `style::Tokens::FONT_FAMILY`에는 **상속 결과만** 기록한다(업스트림이 통로를
+열면 그 한 곳만 고치면 된다). 타이포 계층은 **크기 · 굵기 · 색 · 자름** 네 축으로 만든다.
 
 ## 4단계 파이프라인
 

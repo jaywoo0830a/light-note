@@ -39,15 +39,21 @@ pub fn rail(view: &ViewModel, sink: &IntentSink) -> RawSlot {
     let list = column(TOKENS.tight, rows);
 
     // 바닥: 페이지 조작 · 배율 · 파이프라인 요약.
+    //
+    // 페이지 조작 줄은 **정의(`Intent::RAIL[0]`)를 그대로 그린다** — 버튼이 늘거나 순서가
+    // 바뀌면 정의만 고치면 되고, `tests/ui_plan.rs`가 정의와 화면을 서로 맞춰 본다.
     let actions = row(
         TOKENS.tight,
-        vec![
-            buttons::icon_button(Intent::PagePrev, sink),
-            buttons::icon_button(Intent::PageNext, sink),
-            divider(),
-            buttons::icon_button(Intent::PageAdd, sink),
-            buttons::icon_button(Intent::PageRemove, sink),
-        ],
+        Intent::RAIL[0]
+            .iter()
+            .enumerate()
+            .flat_map(|(index, intent)| {
+                // 묶음 표시: 이동 둘 다음에 세로 구분선 하나(정의에는 넣지 않는다).
+                let divider = (index == 2).then(divider);
+                [divider, Some(buttons::icon_button(*intent, sink))]
+            })
+            .flatten()
+            .collect(),
     );
     let zoom = row(
         TOKENS.tight,

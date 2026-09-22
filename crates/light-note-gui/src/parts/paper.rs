@@ -31,7 +31,7 @@ pub fn frame() -> Border {
         .background(Brush::from(ThemeBrush::SolidBackground))
         .border_brush(Brush::from(ThemeBrush::CardStroke))
         .border_thickness(Thickness::uniform(1.0))
-        .corner_radius(CornerRadius::uniform(TOKENS.radius))
+        .corner_radius(CornerRadius::uniform(TOKENS.sheet))
         .padding(Thickness::uniform(0.0))
 }
 

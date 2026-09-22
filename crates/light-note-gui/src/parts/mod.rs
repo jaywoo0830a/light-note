@@ -171,6 +171,11 @@ pub(crate) fn meta(text: impl Into<String>) -> TextBlock {
     label(text, TOKENS.caption, FontWeight::NORMAL).opacity(0.7)
 }
 
+/// 보조 설명(줄바꿈 허용) — 좁은 창에서 잘리지 않게 **여러 줄로 감는다**.
+pub(crate) fn meta_wrapped(text: impl Into<String>) -> TextBlock {
+    meta(text).text_wrapping(TextWrapping::Wrap)
+}
+
 /// 한 줄로 **자르는** 글자 — 줄바꿈 금지 + 말줄임은 항상 짝이다(예제 22).
 pub(crate) fn clipped(text: impl Into<String>, size: f64, weight: FontWeight) -> TextBlock {
     label(text, size, weight)
