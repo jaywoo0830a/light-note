@@ -8,7 +8,7 @@
 //!
 //! | 조각 | 파일 | 함수 | elm 쪽 |
 //! |---|---|---|---|
-//! | 앱바 | `header` | `header::header` | `<Header />` |
+//! | 타이틀바(네이티브) | `titlebar` | `titlebar::titlebar` | `<TitleBar />` |
 //! | 툴바(버튼 + 미리보기) | `toolbar` | `toolbar::toolbar` | `<Toolbar />` |
 //! | 좌측 레일 | `rail` | `rail::rail` | `<Rail />` |
 //! | 상태바 | `status` | `status::status` | `<Status />` |
@@ -38,12 +38,12 @@
 pub mod buttons;
 pub mod empty;
 pub mod failure;
-pub mod header;
 pub mod loading;
 pub mod paper;
 pub mod rail;
 pub mod shortcuts;
 pub mod status;
+pub mod titlebar;
 pub mod toolbar;
 
 use elm_magic_windows_reactor::RawSlot;
@@ -62,7 +62,7 @@ use crate::ui::{IntentSink, Part, ViewModel};
 /// 조각이 늘어도 호스트의 배선은 그대로다(분기는 여기 한 곳).
 pub fn build(part: Part, view: &ViewModel, sink: &IntentSink) -> RawSlot {
     match part {
-        Part::Header => header::header(view),
+        Part::TitleBar => titlebar::titlebar(view),
         Part::Toolbar => toolbar::toolbar(view, sink),
         Part::Rail => rail::rail(view, sink),
         Part::Status => status::status(view),

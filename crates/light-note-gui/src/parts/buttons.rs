@@ -9,10 +9,12 @@
 //! ## 규칙
 //! - **아이콘은 `SymbolIcon`**(WinUI 내장 심볼 폰트) — 글꼴 패밀리를 못 바꾸는 제약과
 //!   무관하고, 색은 테마를 따라간다.
-//! - **툴팁 + 자동화 이름을 항상 같이** 준다: 아이콘만 있는 버튼은 눈으로만 읽을 수 없다.
+//! - **이름을 옆에도 붙인다**(`labeled_button`): 아이콘만으로 뜻이 서지 않기 때문이다.
+//!   툴팁 + 자동화 이름은 그대로 **항상 같이** 준다(셋이 같은 문구를 쓴다 — 서로 어긋나면
+//!   화면과 접근성이 갈라진다).
 //! - **활성 상태는 `ButtonStyle::Accent`**, 나머지는 `Subtle`(호버에만 배경) — WinUI가
 //!   대비를 보장하므로 색을 계산하지 않는다(예제 25의 "테마가 정하게 둔다").
-//! - 크기는 토큰(`control_h`)에서 온다 — 정사각 아이콘 버튼.
+//! - 크기는 토큰(`control_h`)에서 온다 — 정사각 아이콘 버튼, 라벨 버튼은 높이만 맞춘다.
 //! - `content()`는 `View`를 돌려주므로 **마지막에** 부른다(리액터의 사실).
 
 use std::rc::Rc;
@@ -52,19 +54,9 @@ pub fn symbol(intent: Intent) -> Symbol {
     }
 }
 
-/// 동작 버튼 — 아이콘 하나(호버에만 배경이 생긴다).
+/// 동작 버튼 — 아이콘 하나(호버에만 배경이 생긴다). 레일처럼 좁은 곳이 쓴다.
 pub fn icon_button(intent: Intent, sink: &IntentSink) -> View {
     square_button(ButtonStyle::Subtle, intent, sink)
-}
-
-/// 도구 버튼 — **활성 도구는 액센트 면**이라 지금 무엇으로 그리는지가 한눈에 보인다.
-pub fn tool_button(active: bool, intent: Intent, sink: &IntentSink) -> View {
-    let style = if active {
-        ButtonStyle::Accent
-    } else {
-        ButtonStyle::Subtle
-    };
-    square_button(style, intent, sink)
 }
 
 /// **정사각 아이콘 버튼** — 모든 아이콘 버튼이 지나는 길(모양이 갈라지지 않는다).
@@ -126,4 +118,41 @@ pub fn label_button(label: &str, intent: Intent, sink: &IntentSink) -> View {
         .on_click(move || sink(intent))
         .content(content)
         .tooltip(label)
+}
+
+/// **라벨 붙은 버튼** — 아이콘 + 이름. 툴바가 쓴다(아이콘만으로는 뜻이 서지 않는다).
+///
+/// 이름은 [`Intent::label`] 하나만 쓴다 — 툴팁·자동화 이름·버튼 글자가 **같은 문구**라
+/// 서로 어긋날 수 없다. 폭은 [`crate::style::Tokens::labeled_row_width`]가 어림한다.
+pub fn labeled_button(intent: Intent, sink: &IntentSink) -> View {
+    labeled(ButtonStyle::Subtle, intent, sink)
+}
+
+/// **라벨 붙은 도구 버튼** — 활성 도구는 액센트 면(지금 무엇으로 그리는지가 보인다).
+pub fn labeled_tool_button(active: bool, intent: Intent, sink: &IntentSink) -> View {
+    let style = if active {
+        ButtonStyle::Accent
+    } else {
+        ButtonStyle::Subtle
+    };
+    labeled(style, intent, sink)
+}
+
+/// 라벨 붙은 버튼이 지나는 길 — 모양이 갈라지지 않는다.
+fn labeled(style: ButtonStyle, intent: Intent, sink: &IntentSink) -> View {
+    let sink = Rc::clone(sink);
+    let content = super::row(
+        TOKENS.gap,
+        vec![
+            SymbolIcon::new().symbol(symbol(intent)).into(),
+            super::label(intent.label(), TOKENS.body, FontWeight::NORMAL).into(),
+        ],
+    );
+    Button::new()
+        .style(style)
+        .min_height(TOKENS.control_h)
+        .automation_name(intent.label())
+        .on_click(move || sink(intent))
+        .content(content)
+        .tooltip(intent.label())
 }

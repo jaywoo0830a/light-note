@@ -14,11 +14,12 @@ use light_note_gui::geom::{Pt, Scale, Size};
 use light_note_gui::ink::{InkPoint, Stroke, Style, Tool};
 use light_note_gui::input::Device;
 use light_note_gui::shape::live_ink;
+use light_note_gui::style::TOKENS;
 use light_note_gui::ui::{
     clear_frame, clear_intent_sink, clear_part_builder, clear_surface_builder, clear_view,
     page_label, set_intent_sink, set_part_builder, set_surface_builder, stage_frame, stage_view,
-    Frame, Header, HeaderProps, InkSurface, InkSurfaceProps, Intent, IntentSink, Part, Screen,
-    ScreenProps, Stage, SurfaceSlot, ViewModel,
+    Frame, InkSurface, InkSurfaceProps, Intent, IntentSink, Part, Screen, ScreenProps, Stage,
+    SurfaceSlot, TitleBar, TitleBarProps, ViewModel,
 };
 
 /// 화면이 **항상** 갖는 조각 수 — 앱바 · 툴바 · 레일 · 상태바.
@@ -105,6 +106,39 @@ fn the_chrome_definition_covers_every_intent_once() {
     labels.sort_unstable();
     labels.dedup();
     assert_eq!(labels.len(), Intent::CHROME.len(), "라벨이 중복이다");
+}
+
+#[test]
+fn the_toolbar_rows_fit_the_break_width() {
+    // 라벨을 붙이면 줄이 길어진다 — **한 줄 배치와 좁은 창의 두 줄 배치 모두** 기준 폭 안에
+    // 서야 한다. 폭은 어림값(글자 수 × 1rem/2)이지만 이 계산이 곧 계약이다:
+    // 어림이 넘치면 실제 배치도 넘친다(그때는 라벨을 줄이거나 나누는 자리를 옮긴다).
+    let chars = |groups: &[&[Intent]]| -> Vec<usize> {
+        groups
+            .iter()
+            .flat_map(|group| group.iter().map(|intent| intent.label().chars().count()))
+            .collect()
+    };
+    let one = TOKENS.labeled_row_width(chars(&Intent::TOOLBAR));
+    assert!(
+        one <= TOKENS.toolbar_break,
+        "한 줄 툴바({one} DIP)가 기준 폭({})을 넘는다",
+        TOKENS.toolbar_break
+    );
+
+    // 좁은 창에서 쓰는 나누는 자리도 **정의에서** 온다(화면과 검사가 같은 값을 본다).
+    let split = light_note_gui::parts::toolbar::TOOL_SPLIT;
+    assert!(
+        split > 0 && split < Intent::TOOLBAR.len(),
+        "나누는 자리가 밖이다"
+    );
+    for half in [&Intent::TOOLBAR[..split], &Intent::TOOLBAR[split..]] {
+        let width = TOKENS.labeled_row_width(chars(half));
+        assert!(
+            width <= TOKENS.toolbar_break,
+            "좁은 창의 줄({width} DIP)이 기준 폭을 넘는다"
+        );
+    }
 }
 
 #[test]
@@ -246,7 +280,7 @@ fn the_chrome_values_and_intent_sink_reach_the_parts() {
     stage_view(status.clone());
 
     let mut ctx = Ctx::new();
-    let tree = elm_magic::frame::<Header>(&mut ctx, &HeaderProps::default());
+    let tree = elm_magic::frame::<TitleBar>(&mut ctx, &TitleBarProps::default());
     let mut slot: SurfaceSlot = None;
     elm_magic::raw::invoke(&tree, &mut slot);
     assert!(slot.is_none(), "헤드리스에서는 WinUI 뷰를 만들 수 없다");
@@ -254,7 +288,7 @@ fn the_chrome_values_and_intent_sink_reach_the_parts() {
     let (part, seen, sink) = SEEN_PART
         .with(|slot| slot.borrow().clone())
         .expect("조각 빌더가 받은 것");
-    assert_eq!(part, Part::Header);
+    assert_eq!(part, Part::TitleBar);
     assert_eq!(seen, status, "조각은 화면이 받은 값 그대로를 본다");
 
     // 조각들이 화면에 쓰는 문구 — 값에서 나오고, 전부 영어다.

@@ -33,8 +33,9 @@ use std::rc::Rc;
 use elm_magic::Callback;
 use elm_magic_windows_reactor::{ElmInput, ElmView};
 use windows_reactor::{
-    ChildrenControl, Component, ComponentContext, Grid, View, ViewContext, WindowBackdrop,
-    WindowSize, WindowTheme, WindowVisuals,
+    Border, ChildrenControl, Component, ComponentContext, ContentControl, DragDropAction,
+    DragDropOperation, DragDropPolicy, DragKind, DroppedData, Grid, View, ViewContext,
+    WindowBackdrop, WindowConstraints, WindowSize, WindowTheme, WindowVisuals,
 };
 
 use crate::canvas::{BakeResult, Canvas};
@@ -47,6 +48,7 @@ use crate::input::{self, Phase};
 use crate::parts;
 use crate::pdf::PdfDocument;
 use crate::render;
+use crate::style::TOKENS;
 use crate::tool::CanvasTool;
 use crate::ui::{self, Frame, Intent, Screen, ScreenProps, Stage, ViewModel};
 
@@ -63,6 +65,12 @@ pub enum HostMessage {
     Decoded(usize),
     /// 창 크기가 바뀌었다 (DIP) — 잉크 영역의 높이를 다시 잡는다.
     Resized(f64, f64),
+    /// 끌어온 것이 **창 위에 들어왔다**(공식 `drag-drop` 패턴) — 종류를 그대로 들고 온다.
+    DragEnter(DragKind),
+    /// 끌어온 것이 나갔거나 놓였다 — 안내를 원래대로 돌린다.
+    DragLeave,
+    /// 놓였다 — PDF면 연다(`DroppedData::StorageItems`의 경로를 본다).
+    Dropped(DroppedData),
     /// 백그라운드가 읽은 PDF 파일.
     Opened(Result<OpenedFile, String>),
     /// 백그라운드 내보내기 결과(저장된 경로).
@@ -85,6 +93,8 @@ pub struct Shell {
     help: bool,
     /// 창의 클라이언트 크기 (DIP) — 잉크 영역 높이의 근거(관측이 오기 전에는 기본값).
     viewport: (f64, f64),
+    /// 끌어놓기 안내를 띄우기 **전의** 상태 문구 — 나가면 이 값으로 되돌린다.
+    status_before_drop: Option<String>,
     /// ④-워커에 가 있는 요청 id — **R2: 한 번에 하나**([`Canvas::needs_bake`]).
     baking: Option<u64>,
 }
@@ -103,6 +113,7 @@ impl Component for Shell {
             status: "New note — draw with a pen (digitizer)".to_string(),
             help: false,
             viewport: (1280.0, 800.0),
+            status_before_drop: None,
             baking: None,
         };
         shell.refresh(context);
@@ -124,6 +135,9 @@ impl Component for Shell {
                 // 창 크기가 바뀌었다 — 잉크 영역의 높이만 다시 잡는다(다음 발행에서).
                 self.viewport = (width, height);
             }
+            HostMessage::DragEnter(kind) => self.drop_hover(kind),
+            HostMessage::DragLeave => self.drop_leave(),
+            HostMessage::Dropped(data) => self.dropped(data, context),
             HostMessage::Opened(Ok(file)) => self.adopt_pdf(file),
             HostMessage::Opened(Err(error)) => {
                 self.status = error.clone();
@@ -146,12 +160,24 @@ impl Component for Shell {
         // 창 제목은 호스트가 정한다(elm은 플랫폼을 모른다 — 예제 20).
         context.window_title(format!("light-note — {}", self.canvas.doc().title()));
 
-        // **창 자체의 스타일**(예제 21): 테마는 시스템을 따르고 배경은 Mica.
-        // 창은 호스트만 만질 수 있다 — elm에는 창이라는 개념이 없다(어댑터가 옮기지 않는다).
+        // **창 자체의 디자인**: 테마는 시스템, 배경은 Mica, 크기 하한은 크롬이 무너지지 않는
+        // 값, 처음 크기는 한 줄 툴바가 서는 값. (리액터는 **값이 바뀔 때만** 적용하므로
+        // 사용자가 창을 줄이거나 늘리는 것과 싸우지 않는다 — `native/winui`의 diff 확인.)
+        //
+        // 타이틀바는 여기서 만들지 않는다: 조각(`parts::titlebar`)이 WinUI `TitleBar`를 만들면
+        // 리액터가 `SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` +
+        // `PreferredHeightOption`까지 붙인다 — 크롬이 **네이티브 것**이 된다.
         context.window_visuals(
             WindowVisuals::new()
                 .theme(WindowTheme::System)
-                .backdrop(WindowBackdrop::Mica),
+                .backdrop(WindowBackdrop::Mica)
+                .client_size(TOKENS.default_window_w, TOKENS.default_window_h)
+                .constraints(WindowConstraints {
+                    min_width: Some(TOKENS.min_window_w),
+                    min_height: Some(TOKENS.min_window_h),
+                    max_width: None,
+                    max_height: None,
+                }),
         );
 
         // **창 크기 관측** — 잉크 영역이 창 안에 들어오게 하는 근거다(elm 트리는 StackPanel뿐이라
@@ -186,7 +212,7 @@ impl Component for Shell {
             render::surface(frame, &sink, &decoded, view)
         }));
 
-        // 조각 빌더 — `<Raw>` 슬롯(앱바/툴바/레일/상태바/안내/단축키)이 같은 함수를 부른다.
+        // 조각 빌더 — `<Raw>` 슬롯(타이틀바/툴바/레일/상태 띠/안내/단축키)이 같은 함수를 부른다.
         // 조각의 생김새는 `parts`에만 있으므로, 스타일을 바꿔도 이 파일은 그대로다.
         ui::set_part_builder(Rc::new(parts::build));
 
@@ -213,10 +239,36 @@ impl Component for Shell {
             ..Default::default()
         }));
 
-        // 가속기의 자리는 **창 전체를 담는 루트**다(예제 27: 껍데기는 호스트, 자리는 elm).
-        Grid::new()
-            .key_accelerators(accelerators)
-            .children((screen,))
+        // ── 루트: **끌어놓기**(공식 `drag-drop` 패턴) + 가속기 ────────────────
+        // `Border`가 `drop_policy`/`on_drop`을 가진다(리액터의 `Border` 속성 목록) — 그래서
+        // **창 전체**가 놓기 대상이 된다(툴바·레일 위에 떨어뜨려도 열린다). 가속기는 안쪽
+        // `Grid`에 그대로 남는다: `Border`에는 `key_accelerators`가 없다.
+        let enter_sender = sender.clone();
+        let over_sender = sender.clone();
+        let leave_sender = sender.clone();
+        let drop_sender = sender.clone();
+        Border::new()
+            .drop_policy(DragDropPolicy::new().storage_items(
+                DragDropAction::new(DragDropOperation::Copy).caption("Drop to open the PDF"),
+            ))
+            .on_drag_enter(move |kind: DragKind| {
+                let _ = enter_sender.send(HostMessage::DragEnter(kind));
+            })
+            // 들어오는 순간과 움직이는 순간이 따로 온다 — 둘 다 같은 안내로 모은다.
+            .on_drag_over(move |kind: DragKind| {
+                let _ = over_sender.send(HostMessage::DragEnter(kind));
+            })
+            .on_drag_leave(move || {
+                let _ = leave_sender.send(HostMessage::DragLeave);
+            })
+            .on_drop(move |data: DroppedData| {
+                let _ = drop_sender.send(HostMessage::Dropped(data));
+            })
+            .content(
+                Grid::new()
+                    .key_accelerators(accelerators)
+                    .children((screen,)),
+            )
     }
 }
 
@@ -493,6 +545,52 @@ impl Shell {
 
 /// 파일 입출력 — 파이프라인 밖이지만 셸이 소유한다(대화상자는 UI 스레드, IO는 워커).
 impl Shell {
+    /// 끌어온 것이 들어왔다 — **상태 띠가 무엇을 하면 되는지** 말한다(종류별로 다르게).
+    ///
+    /// 문구를 띄우기 전의 상태를 [`Shell::status_before_drop`]에 남긴다: 나가면 되돌려야
+    /// 하기 때문이다(놓지 않고 나가는 것이 정상 경로다).
+    fn drop_hover(&mut self, kind: DragKind) {
+        if self.status_before_drop.is_none() {
+            self.status_before_drop = Some(self.status.clone());
+        }
+        self.status = match kind {
+            DragKind::StorageItems => "Drop a PDF to open it".to_string(),
+            DragKind::Text => "Drop a PDF file, not text".to_string(),
+            DragKind::Unsupported => "Only PDF files can be opened".to_string(),
+        };
+    }
+
+    /// 끌어온 것이 나갔다 — 안내를 원래 문구로 되돌린다.
+    fn drop_leave(&mut self) {
+        if let Some(previous) = self.status_before_drop.take() {
+            self.status = previous;
+        }
+    }
+
+    /// 놓였다 — **PDF 하나면 연다**(공식 `drag-drop` 샘플과 같은 흐름: 경로를 꺼내 워커에 맡긴다).
+    ///
+    /// 고르는 일은 순수 함수([`files::first_pdf`])가 한다: 화면 없이 테스트되는 자리다.
+    fn dropped(&mut self, data: DroppedData, context: &ComponentContext<Self>) {
+        self.drop_leave();
+        let paths = match data {
+            DroppedData::StorageItems(items) => {
+                items.into_iter().map(|item| item.path).collect::<Vec<_>>()
+            }
+            // 텍스트·알 수 없는 형식은 열 것이 없다 — **왜 안 되는지**를 말한다.
+            _ => {
+                self.status = "Only PDF files can be opened".to_string();
+                return;
+            }
+        };
+        let Some(path) = files::first_pdf(paths) else {
+            self.status = "Only PDF files can be opened".to_string();
+            return;
+        };
+        self.stage = Stage::Loading;
+        self.status = format!("Opening {}…", path.display());
+        let _ = context.spawn_background(move |_cancel| HostMessage::Opened(files::read_pdf(path)));
+    }
+
     /// PDF 열기 — 대화상자(UI 스레드) → 읽기(워커) → 파싱(지연 파싱이라 싸다).
     fn open_pdf(&mut self, context: &ComponentContext<Self>) {
         let Some(path) = files::pick_pdf() else {

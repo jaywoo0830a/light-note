@@ -328,8 +328,8 @@ pub type SurfaceBuilder = Rc<dyn Fn(&Frame, &ViewModel) -> SurfaceSlot>;
 /// [`IntentSink`]는 쓸 수 있다**(표면이 포인터를 다루는 것과 같은 방법).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Part {
-    /// 앱바 — 앱 이름 · 문서 제목 · 배지.
-    Header,
+    /// **네이티브 타이틀바** — 문서 제목 · 배경 요약 · 배지(WinUI `TitleBar`).
+    TitleBar,
     /// 툴바 — 아이콘 버튼 묶음 + 잉크 미리보기.
     Toolbar,
     /// 좌측 레일 — 페이지 목록 + 페이지/배율 조작.
@@ -454,10 +454,13 @@ fn part(part: Part) -> SurfaceSlot {
 }
 
 elm_magic::view! {
-    /// 앱바 — 앱 이름 · 문서 제목 · 배지.
-    pub fn Header() {
+    /// **네이티브 타이틀바** — 문서 제목 · 배경 요약 · 배지.
+    ///
+    /// 리액터가 이 요소를 창의 타이틀바로 붙인다(캡션 버튼·드래그 영역·Mica가 따라온다) —
+    /// 그래서 크롬이 **우리 것이 아니라 WinUI 것**이 되고, 모양은 조각이 정한다.
+    pub fn TitleBar() {
         <Raw>|out: &mut SurfaceSlot| {
-            *out = part(Part::Header);
+            *out = part(Part::TitleBar);
         }</Raw>
     }
 }
@@ -536,7 +539,7 @@ elm_magic::view! {
 }
 
 elm_magic::view! {
-    /// light-note 화면 — 앱바 / 툴바 / 레일 / 잉크 표면 / 상태바 / 단축키 패널.
+    /// light-note 화면 — 타이틀바 / 툴바 / 레일 / 잉크 표면 / 상태 띠 / 단축키 패널.
     ///
     /// ## 이 본문에 있는 것과 없는 것
     /// - **있는 것**: 구조(어떤 조각이 어디에 있는가)와 분기(단계·단축키 패널).
@@ -555,8 +558,8 @@ elm_magic::view! {
         on_key("Escape") { on_intent(Intent::CloseHelp) }
 
         <Col>
-            // ── 앱바 (조각) ─────────────────────────────────────
-            <Header />
+            // ── 네이티브 타이틀바 (조각): 제목 + 배지 + 캡션 버튼 ──
+            <TitleBar />
 
             // ── 툴바 (조각): 아이콘 버튼 + 잉크 미리보기 ────────
             <Toolbar />

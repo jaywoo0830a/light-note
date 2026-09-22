@@ -42,7 +42,7 @@ scale = Scale::DEFAULT(1.5) × zoom/100        // 1pt = scale 픽셀
 |---|---|---|
 | 셸(호스트) | 문서·PDF·도구·줌·**④-워커 예약**·창 스타일·**의도 통로** | `src/app.rs` (`Shell`) |
 | elm 화면 | 구조(조각의 자리)와 분기(단계·단축키 패널) + F1/Esc → 의도 | `src/ui.rs` |
-| 조각(스타일·버튼) | 앱바·툴바·레일·상태바·안내·실패·단축키·종이의 생김새와 **버튼** | `src/parts/` (토큰은 `src/style.rs`) |
+| 조각(스타일·버튼) | 타이틀바·툴바·레일·상태바·안내·실패·단축키·종이의 생김새와 **버튼** | `src/parts/` (토큰은 `src/style.rs`) |
 | WinUI 트리 | 컨트롤 트리(베이스 `Image` 2장 + 꼬리 그룹) | `src/render.rs` |
 | ③ 캔버스 | 문서 + **구운 접두사**(`Base`) + **꼬리**(`Rc<[LiveInk]>`) | `src/canvas.rs` |
 | 모델 | 페이지·획·Undo/Redo | `src/doc.rs`, `src/ink.rs` |
@@ -350,7 +350,7 @@ slots = [ Slot { png: None, page: 0, scale, count: 0 },
 
 ```text
 Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app.rs)
-└ Col(elm)                  앱바 · 툴바 · 정보 띠 · 본문 · 단축키 (조각은 전부 <Raw>)
+└ Col(elm)                  타이틀바 · 툴바 · 정보 띠 · 본문 · 단축키 (조각은 전부 <Raw>)
   └ Border                  책상(둘레 24 DIP) → 스크롤 상자(높이 = 창 − 크롬) 안
     └ Border                종이 배경 + **포인터 이벤트**
       └ Canvas              width/height = 페이지 픽셀(=DIP), 절대 좌표

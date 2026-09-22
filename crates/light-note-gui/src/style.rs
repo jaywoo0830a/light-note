@@ -85,7 +85,7 @@ pub struct Tokens {
     pub gap: f64,
     /// 묶음 사이 간격 (DIP) — 제목과 부제 사이.
     pub block: f64,
-    /// 표면 **안쪽** 여백 (DIP) — 앱바·툴바·레일·상태바.
+    /// 표면 **안쪽** 여백 (DIP) — 툴바·레일·상태 띠.
     pub pad: f64,
     /// 종이 둘레의 책상 여백 (DIP) — 페이지가 창보다 클 때의 호흡.
     pub page: f64,
@@ -111,7 +111,22 @@ pub struct Tokens {
     pub line_max: f64,
     /// 상태바 높이 (DIP).
     pub status_h: f64,
-    /// 크롬(앱바 + 툴바 + 정보 띠)의 대략 높이 (DIP).
+    /// **네이티브 타이틀바** 높이 (DIP) — WinUI `TitleBarHeightOption::Tall`(=48).
+    ///
+    /// 우리가 정하는 숫자가 아니라 **고른 프리셋의 높이**다(`TitleBar::preferred_height`).
+    /// [`Tokens::chrome_h`]에 이 높이가 포함돼야 잉크 영역이 창 밖으로 나가지 않는다.
+    pub titlebar_h: f64,
+    /// 한 줄 툴바가 성립하는 **최소 창 폭** (DIP) — 이보다 좁으면 버튼 줄을 둘로 나눈다.
+    pub toolbar_break: f64,
+    /// 창의 **최소 폭** (DIP) — 크롬이 무너지지 않는 하한(`WindowConstraints`).
+    pub min_window_w: f64,
+    /// 창의 **최소 높이** (DIP) — 크롬 + 종이 한 뼘.
+    pub min_window_h: f64,
+    /// 처음 열 때의 **창 폭** (DIP) — 한 줄 툴바가 서는 크기(값이 바뀔 때만 적용된다).
+    pub default_window_w: f64,
+    /// 처음 열 때의 **창 높이** (DIP).
+    pub default_window_h: f64,
+    /// 크롬(네이티브 타이틀바 + 툴바 + 정보 띠)의 대략 높이 (DIP).
     ///
     /// **추정값**이다: 잉크 영역이 창 안에 들어오게 하려면 "창 높이 − 크롬"이 필요한데,
     /// 크롬 높이는 컨트롤이 스스로 정하므로 여기서 어림한다(레이아웃이 바뀌면 이 값도 바꾼다).
@@ -147,6 +162,27 @@ impl Tokens {
     ///
     /// 종이처럼 창을 크게 차지하는 면의 모서리는 이 값의 배수(16 × 2n)만 쓴다.
     pub const STEP: f64 = Self::BASE * 2.0;
+
+    /// 본문 한 글자의 **평균 폭** (DIP) — 1rem의 절반.
+    ///
+    /// 글자 폭은 글꼴이 정하므로 정확할 수 없다(글꼴은 지정할 수 없다 — 모듈 문서).
+    /// 그래도 **어림값을 토큰으로 두면** "한 줄이 성립하는가"를 헤드리스로 검사할 수 있다.
+    pub const CHAR_W: f64 = Self::BASE / 2.0;
+
+    /// 라벨 붙은 버튼 한 줄의 **예상 폭** (DIP) — 패딩 + 아이콘 + 간격 + 글자.
+    ///
+    /// `labels`는 라벨의 **글자 수**다(`Intent::label().chars().count()`).
+    /// 결과가 [`Tokens::toolbar_break`]보다 크면 그 줄은 둘로 나눠야 한다 —
+    /// `tests/ui_plan.rs`가 실제 라벨로 이 검사를 한다.
+    pub fn labeled_row_width(&self, labels: impl IntoIterator<Item = usize>) -> f64 {
+        let labels: Vec<usize> = labels.into_iter().collect();
+        // 버튼 하나 = WinUI 기본 좌우 패딩 + 아이콘(≈ control_h 안에 들어간다) + 간격 + 글자.
+        let buttons: f64 = labels
+            .iter()
+            .map(|chars| self.control_h + self.gap + *chars as f64 * Self::CHAR_W)
+            .sum();
+        buttons + self.tight * labels.len().saturating_sub(1) as f64
+    }
 
     /// `UNIT`의 배수인가 — 간격과 작은 면의 모서리가 지켜야 하는 규칙.
     pub fn is_unit_multiple(value: f64) -> bool {
@@ -198,13 +234,19 @@ impl Tokens {
     }
 
     /// 화면의 **고정 크기** — 전부 `UNIT` 또는 `BASE`의 배수여야 한다(테스트가 확인한다).
-    pub fn fixed_sizes(&self) -> [f64; 7] {
+    pub fn fixed_sizes(&self) -> [f64; 13] {
         [
             self.control_h,
             self.preview_w,
             self.preview_h,
             self.line_max,
             self.status_h,
+            self.titlebar_h,
+            self.toolbar_break,
+            self.min_window_w,
+            self.min_window_h,
+            self.default_window_w,
+            self.default_window_h,
             self.chrome_h,
             self.content_min,
         ]
@@ -236,12 +278,18 @@ pub const TOKENS: Tokens = Tokens {
     body: Tokens::BASE * Tokens::SCALE[2],    // 16
     caption: Tokens::BASE * Tokens::SCALE[3], // 12
     // 고정 크기 — UNIT 또는 BASE의 배수
-    rail: Tokens::BASE * 16.0,        // 256
-    control_h: Tokens::UNIT * 9.0,    // 36
-    preview_w: Tokens::UNIT * 50.0,   // 200
-    preview_h: Tokens::UNIT * 8.0,    // 32
-    line_max: Tokens::UNIT * 5.0,     // 20
-    status_h: Tokens::UNIT * 10.0,    // 40
-    chrome_h: Tokens::UNIT * 130.0,   // 520
-    content_min: Tokens::UNIT * 60.0, // 240
+    rail: Tokens::BASE * 16.0,             // 256
+    control_h: Tokens::UNIT * 9.0,         // 36
+    preview_w: Tokens::UNIT * 50.0,        // 200
+    preview_h: Tokens::UNIT * 8.0,         // 32
+    line_max: Tokens::UNIT * 5.0,          // 20
+    status_h: Tokens::UNIT * 10.0,         // 40
+    titlebar_h: Tokens::UNIT * 12.0,       // 48 = WinUI TitleBarHeightOption::Tall
+    toolbar_break: Tokens::UNIT * 340.0,   // 1360 (라벨 12개를 한 줄에 세우는 하한 ≈1316)
+    min_window_w: Tokens::BASE * 45.0,     // 720
+    min_window_h: Tokens::BASE * 35.0,     // 560
+    default_window_w: Tokens::BASE * 90.0, // 1440 (한 줄 툴바가 서는 크기)
+    default_window_h: Tokens::BASE * 55.0, // 880
+    chrome_h: Tokens::UNIT * 110.0,        // 440 (타이틀바 48 + 툴바 + 정보 띠)
+    content_min: Tokens::UNIT * 60.0,      // 240
 };

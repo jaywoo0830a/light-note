@@ -48,7 +48,7 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 이 백엔드는 `css!`/`class`를 읽지 않는다. 스타일을 만드는 통로는 **`<Raw>` 하나**이고,
 `<Raw>` 본문은 매크로가 그대로 복사하므로 그 안에서 elm 상태를 읽을 수도 없다. 그래서:
 
-- **화면(`ui.rs`)에는 버튼도 색도 간격도 없다** — 조각을 선언하고(`<Header />` 등) 값을
+- **화면(`ui.rs`)에는 버튼도 색도 간격도 없다** — 조각을 선언하고(`<TitleBar />` 등) 값을
   내려보낸다. **elm의 `<Button>`은 쓰지 않는다**: WinUI 기본 모양으로 굳어 아이콘·크기·
   색·툴팁을 줄 방법이 없다.
 - **버튼은 조각이 만든다**(`parts/buttons.rs`). `<Raw>` 안에서 elm 콜백은 못 쓰지만
@@ -56,8 +56,9 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
   같은 방법이다(`app.rs`가 `sender`를 캡처해 통로를 등록한다). 그래서 버튼 하나는
   `Button::new().on_click(|| sink(intent))`이고, 아이콘은 WinUI 내장 `SymbolIcon`,
   활성 도구는 `ButtonStyle::Accent`, 나머지는 `Subtle`(호버에만 배경)이며
-  **툴팁 + 자동화 이름을 항상 같이** 준다(아이콘만 있는 버튼의 접근성).
-- **조각마다 파일 하나 + 함수 하나**(`parts/`) — 앱바 · 툴바(버튼 + 잉크 미리보기) · 레일 ·
+  **이름을 옆에 붙이고**(아이콘만으로는 뜻이 서지 않는다) **툴팁 + 자동화 이름을 항상 같이**
+  준다(셋이 같은 문구를 쓴다).
+- **조각마다 파일 하나 + 함수 하나**(`parts/`) — 타이틀바(네이티브) · 툴바(버튼 + 잉크 미리보기) · 레일 ·
   상태바 · 빈 상태 · 여는 중 · 실패 · 단축키 · 종이.
 - **정의는 플랫폼 무관**(`ui.rs`) — `Intent::TOOLBAR`/`Intent::RAIL`/`Intent::CHROME`가
   "어떤 의도가 어디에 있는가"를 들고 있고 `tests/ui_plan.rs`가 빠짐·중복·라벨을 검증한다.
@@ -67,18 +68,22 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
   간격·작은 면의 모서리·고정 크기는 `UNIT × n`, 큰 면(종이)의 모서리는 `STEP × n`(16×2n),
   글자 크기는 `BASE × 배율표`(1.75 / 1.25 / 1 / 0.75rem)다. 색은 **테마 브러시 이름**이라
   라이트/다크/고대비가 공짜로 따라온다. 규칙은 `tests/style.rs`가 고정한다.
-- 창 자체의 스타일(테마·Mica 배경)은 호스트만 만질 수 있다(`app.rs`의 `WindowVisuals`).
+- 창 자체의 디자인(테마·Mica·최소/처음 크기)은 호스트만 만질 수 있고(`app.rs`의
+  `WindowVisuals`), **타이틀바는 네이티브 WinUI `TitleBar`** 다(`parts/titlebar.rs`) —
+  캡션 버튼·드래그 영역·Mica가 전부 시스템 것이다.
 
 ### 레이아웃 (조각의 자리)
 
 ```text
-Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
-└ 앱바      제목 · 배경(PDF) · 배지(페이지/배율/입력/저장 안 됨)   parts/header.rs
-├ 툴바      아이콘 버튼 12개(5묶음) + 잉크 미리보기(색·굵기)      parts/toolbar.rs
-├ 정보 띠   상태 문구 · 힌트 · 도구/획/파이프라인/배율            parts/status.rs
-├ 본문 ┬ 레일  페이지 목록(줄을 누르면 이동) · 조작 · 배율        parts/rail.rs
-│      └ 종이  잉크 표면 (빈 상태 안내 / 스피너 / 실패 카드)      render.rs · parts/{paper,empty,loading,failure}.rs
-└ 단축키    F1로 열고 Esc로 닫는다(호스트가 상태를 소유)          parts/shortcuts.rs
+Border (루트: PDF 끌어놓기 — 공식 drag-drop 패턴)              app.rs
+└ Grid (가속기 Ctrl+±/Ctrl+Enter)
+  ├ 타이틀바  네이티브 WinUI TitleBar: 제목·부제·배지 + 캡션 버튼  parts/titlebar.rs
+  ├ 툴바      아이콘+라벨 버튼 12개(5묶음, 창 폭에 따라 1~2줄)      parts/toolbar.rs
+  │           + 잉크 미리보기(색·굵기)
+  ├ 정보 띠   상태 문구 · 힌트 · 도구/획/파이프라인/배율            parts/status.rs
+  ├ 본문 ┬ 레일  페이지 목록(줄을 누르면 이동) · 조작 · 배율        parts/rail.rs
+  │      └ 종이  잉크 표면 (빈 상태 안내 / 스피너 / 실패 카드)      render.rs · parts/{paper,empty,loading,failure}.rs
+  └ 단축키    F1로 열고 Esc로 닫는다(호스트가 상태를 소유)          parts/shortcuts.rs
 ```
 
 ### 이 백엔드에서 **믿을 수 있는 것 / 없는 것** (실측으로 확인)
@@ -97,6 +102,21 @@ Grid (루트: 가속기 Ctrl+±/Ctrl+Enter)                        app.rs
 그래서 배치는 **줄을 나누는 것**으로만 하고(양 끝 정렬 대신 두 줄), 잉크 영역 높이는
 호스트가 창 크기를 관측해 내려주며, 정보 띠는 **본문 위**에 둔다(추정이 틀려도 잘리는 것은
 종이의 아래쪽뿐이다).
+
+### windows-rs **공식 샘플**과 맞춰 본 것
+
+`crates/samples`의 샘플을 하나씩 대조했다 — **따른 것 / 따르지 않은 것과 그 이유**:
+
+| 샘플 | 우리 코드 | 판정 |
+|---|---|---|
+| `reactor/window` | `window_title` · `window_visuals`(Mica·`client_size`·`constraints`) · `on_window_size`를 **발행마다 선언** | ✅ 그대로 따른다(선언은 매번 다시 선언하는 것이 맞다) |
+| `reactor/drag-drop` | 루트 `Border`의 `drop_policy` + `on_drag_enter/over/leave/drop` → PDF를 끌어놓으면 연다 | ✅ 따른다(경로 판단은 순수 함수 `files::first_pdf`라 화면 없이 테스트된다) |
+| `reactor/pointer-tracking` | 표면에 `capture_pointer_on_press(true)` + pressed/moved/released + **capture-lost·canceled를 하나로 모은다** | ✅ 따른다(캡처를 잃은 획이 남지 않는다) |
+| `windows/*`(서브클래싱) | ①디지타이저가 `SetWindowSubclass` + `DefSubclassProc`로 `WM_POINTER`를 **관찰만** 한다 | ✅ 따른다(`SetWindowLongPtr`을 쓰지 않는다) |
+| `reactor/element-ref` | `ElementRef`로 **크기 관측은 없다**(focus·surface·composition·rasterization-scale뿐) | ❌ 못 쓴다 → `chrome_h` **추정값**이 남는다(정직한 한계) |
+| `reactor/use-effect` | 효과는 **커밋 이후** 실행된다 — 조각 빌더/싱크는 그 발행의 렌더 **전에** 꽂혀야 한다 | ❌ 쓰지 않는다(첫 프레임이 빈 크롬이 된다). 호스트 배선은 `view()`에서 한다 |
+| `reactor/responsive-navigation` | 분기 기준이 `NavigationView`의 display mode다 | ❌ 대신 `on_window_size` + `TOKENS.toolbar_break`로 툴바 줄을 나눈다 |
+| `reactor/text-trimming` | 긴 문장은 `NoWrap` + `WordEllipsis` + `max_lines(1)`을 **짝으로** 준다 | ✅ 따른다 |
 
 **사용자가 읽는 문자열은 전부 영어다**(버튼·상태 문구·힌트·오류·배지).
 `tests/ui_plan.rs::every_visible_string_is_english_only`가 비-ASCII 알파벳을 금지한다

@@ -47,6 +47,24 @@ pub fn read_pdf(path: PathBuf) -> Result<OpenedFile, String> {
     Ok(OpenedFile { path, bytes })
 }
 
+/// 끌어놓은 경로들에서 **첫 PDF**를 고른다 — 파일을 읽기 전에 거른다(순수 함수).
+///
+/// 확장자만 보고(대소문자 무시) **읽지 않는다**: 놓인 파일이 PDF가 아니면 여기서 끝나고,
+/// 상태 띠가 "왜 안 열리는지"를 말한다([`crate::app::Shell`]). 여러 개를 놓으면 첫 PDF 하나만
+/// 연다 — 지금은 문서가 하나뿐이라 그 이상은 의미가 없다.
+pub fn first_pdf(paths: impl IntoIterator<Item = String>) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| is_pdf(path))
+}
+
+/// PDF 확장자인가 — **대소문자를 가리지 않는다**(`.PDF`도 PDF다).
+fn is_pdf(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
 /// 저장 경로를 묻는다 — **UI 스레드**에서 부른다.
 pub fn pick_save(extension: &str, filter: &str, suggested: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
