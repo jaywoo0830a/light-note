@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use light_note_gui::canvas::{Canvas, LIVE_SHAPE_BUDGET};
 use light_note_gui::doc::Edit;
 use light_note_gui::geom::{Pt, Scale, Size};
-use light_note_gui::ink::{Rgba, Style, Tool};
-use light_note_gui::input::{self, Phase};
+use light_note_gui::ink::{InkPoint, Rgba, Style, Tool};
+use light_note_gui::input::{self, Device, Phase, PointerFrame, FRAME_TTL_MS};
 use light_note_gui::render;
 use light_note_gui::tool::CanvasTool;
 
@@ -74,7 +74,121 @@ fn stage1_two_cancel_paths_are_one_phase() {
     assert!(!Phase::Moved.is_end());
 }
 
+#[test]
+fn stage1_a_pen_frame_brings_pressure_and_tilt() {
+    // ①은 하드웨어 프레임을 **버리지 않고** 들고 온다 — 장치·필압·틸트가 표본에 붙는다.
+    let frame = PointerFrame::new(Device::Pen, Some(0.5), Some((12.0, -30.0)), Instant::now());
+    let sample = input::sample_with(
+        Phase::Pressed,
+        150.0,
+        300.0,
+        Scale::from_zoom(100.0),
+        Some(frame),
+    );
+    assert_eq!(sample.at, Pt::new(100.0, 200.0), "좌표 변환은 그대로다");
+    assert_eq!(sample.device(), Device::Pen);
+    assert_eq!(sample.pressure(), Some(0.5));
+    assert_eq!(sample.tilt(), Some((12.0, -30.0)));
+    assert!(sample.is_ink(), "펜만 잉크가 된다");
+}
+
+#[test]
+fn stage1_only_a_digitizer_makes_ink() {
+    // 손가락은 필기가 아니다 — 그리고 프레임이 없으면 장치를 모르는 입력, 곧 마우스다.
+    let touch = PointerFrame::new(Device::Touch, None, None, Instant::now());
+    let touched = input::sample_with(
+        Phase::Pressed,
+        0.0,
+        0.0,
+        Scale::from_zoom(100.0),
+        Some(touch),
+    );
+    assert_eq!(touched.device(), Device::Touch);
+    assert!(!touched.is_ink(), "손가락은 잉크를 만들지 않는다");
+    assert_eq!(touched.pressure(), None, "터치에는 필압이 없다");
+
+    let bare = input::sample(Phase::Pressed, 0.0, 0.0, Scale::from_zoom(100.0));
+    assert_eq!(bare.device(), Device::Mouse, "WM_POINTER가 없으면 마우스다");
+    assert!(!bare.is_ink(), "마우스는 잉크를 만들지 않는다");
+}
+
+#[test]
+fn stage1_a_stale_frame_is_dropped() {
+    // 펜을 떼고 온 표본에 펜 압력(과 "펜이다"라는 자격)이 붙으면 둘 다 거짓이다.
+    let then = Instant::now() - Duration::from_millis(FRAME_TTL_MS + 1);
+    let old = PointerFrame::new(Device::Pen, Some(0.9), None, then);
+    let sample = input::sample_with(Phase::Moved, 10.0, 10.0, Scale::from_zoom(100.0), Some(old));
+    assert_eq!(sample.frame, None, "TTL 밖의 프레임은 버린다");
+    assert_eq!(sample.pressure(), None);
+    assert!(
+        !sample.is_ink(),
+        "낡은 펜 프레임으로 마우스를 필기로 만들지 않는다"
+    );
+}
+
+#[test]
+fn stage1_win32_pen_values_keep_their_contract() {
+    // Win32 계약: 압력 0~1024 → 0.0~1.0, 틸트 -90~90도.
+    assert_eq!(input::pressure_from_raw(0), 0.0);
+    assert_eq!(input::pressure_from_raw(512), 0.5);
+    assert_eq!(input::pressure_from_raw(1024), 1.0);
+    assert_eq!(input::pressure_from_raw(u32::MAX), 1.0, "범위 밖은 자른다");
+    assert_eq!(input::tilt_from_raw(-90), -90.0);
+    assert_eq!(input::tilt_from_raw(0), 0.0);
+    assert_eq!(input::tilt_from_raw(120), 90.0);
+}
+
 // ── ② CanvasTool ────────────────────────────────────────────────────
+
+#[test]
+fn stage2_only_the_pen_is_accepted() {
+    // 필기 정책은 ②에 있다 — 장치 판정은 ①이 하고(WM_POINTER), ②가 그 판정을 적용한다.
+    assert!(CanvasTool::accepts(Device::Pen));
+    assert!(!CanvasTool::accepts(Device::Touch));
+    assert!(!CanvasTool::accepts(Device::Mouse));
+}
+
+#[test]
+fn stage2_hardware_pressure_wins_over_speed() {
+    // 압력의 출처는 하나다: 하드웨어가 보고했으면 그것, 아니면 속도 추정.
+    let mut canvas = Canvas::new(Size::A4);
+    let mut tool = CanvasTool::new();
+    tool.press_with(canvas.doc_mut(), Pt::new(10.0, 10.0), at(0), Some(0.2));
+    tool.drag_with(canvas.doc_mut(), Pt::new(30.0, 10.0), at(8), Some(0.9));
+    let Some(Edit::AddStroke { stroke, .. }) = tool.lift(canvas.doc_mut()) else {
+        panic!("펜 획은 커밋돼야 한다");
+    };
+    let pressures: Vec<f32> = stroke.points().iter().map(|point| point.pressure).collect();
+    assert_eq!(pressures, vec![0.2, 0.9], "필압이 그대로 점에 들어간다");
+
+    let style = Style::for_tool(Tool::Pen);
+    assert!(
+        style.width_at(0.2) < style.width_at(0.9),
+        "필압이 굵기를 만든다"
+    );
+}
+
+#[test]
+fn stage2_without_hardware_pressure_speed_still_drives_width() {
+    // 압력을 안 보내는 디지타이저여도 필기는 된다 — 그때는 속도가 굵기를 만든다.
+    let mut canvas = Canvas::new(Size::A4);
+    let mut tool = CanvasTool::new();
+    let edit = draw(
+        &mut tool,
+        &mut canvas,
+        &line(Pt::new(10.0, 10.0), Pt::new(90.0, 40.0), 20),
+    );
+    let Some(Edit::AddStroke { stroke, .. }) = edit else {
+        panic!("획이 커밋돼야 한다");
+    };
+    assert!(
+        stroke
+            .points()
+            .iter()
+            .any(|point| point.pressure < InkPoint::DEFAULT_PRESSURE),
+        "하드웨어 필압이 없으면 속도가 굵기를 만든다"
+    );
+}
 
 #[test]
 fn stage2_a_drag_becomes_exactly_one_edit() {

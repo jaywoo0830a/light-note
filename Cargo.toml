@@ -21,3 +21,5 @@ pdf-writer = "0.15"
 windows-reactor = "0.100"
 # 네이티브 파일 대화상자(IFileDialog) — Windows 전용
 rfd = "0.15"
+# Win32 `WM_POINTER` — 디지타이저(펜) 장치·필압·틸트. Windows 대상에서만 컴파일된다.
+windows = "0.62"

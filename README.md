@@ -9,6 +9,9 @@
   검증할 수 있다.
 - **UI**: [`elm-magic`](https://crates.io/crates/elm-magic) 0.8.7 + `elm-magic-windows-reactor`
   0.8.7 어댑터(선언적 WinUI 3, `windows-reactor` 0.100). 파일 대화상자는 `rfd` 0.15.
+- **입력**: Win32 `WM_POINTER`(`windows` 0.62) — **디지타이저(펜)만 필기**하게 하고
+  필압·틸트를 여기서 읽는다(`digitizer`). WinUI의 `PointerEventInfo`에는 장치도, pointer id도,
+  압력도 없기 때문이다.
 
 ## 구조 — 크레이트 하나, 파이프라인 하나
 
@@ -26,8 +29,9 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 | `geom` | — | 좌표계 계약(pt, **좌상단 원점**), 배율(pt↔px), 선분 거리 |
 | `ink` | — | 도구·스타일·압력 표본·스트로크(샘플 필터, 히트 테스트) |
 | `doc` | — | 페이지·문서·편집 기록(Undo/Redo) — **진행 중 획은 여기 없다** |
-| `input` | ① | WinUI 포인터(DIP) → 표본(`Pt` + 위상), O(1) |
-| `tool` | ② | 표본 → 획·지우개, press/drag/lift/cancel, 속도→압력 |
+| `input` | ① | WinUI 포인터(DIP) → 표본(`Pt` + 위상 + **장치·필압·틸트**), O(1) |
+| `digitizer` | ① | Win32 `WM_POINTER` → 장치·필압·틸트(창 서브클래스, **관찰만**) — Windows 전용 |
+| `tool` | ② | 표본 → 획·지우개, press/drag/lift/cancel, **펜만 필기**, 압력(필압, 없으면 속도) |
 | `canvas` | ③ | 문서 + **구운 접두사** + **안 구운 꼬리**, 베이크 요청(latest-wins) |
 | `render` | ④ | `Frame` → WinUI 트리(키 diff), 베이크(워커), 가속키 |
 | `ui` | ④ | elm-magic 화면(`Screen`/`InkSurface`) + `<Raw>` 경계 |
@@ -40,7 +44,7 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 ## 4단계 파이프라인
 
 ```text
-① HardwareInput  [UI]    WinUI 포인터 → Sample              (input)
+① HardwareInput  [UI]    WinUI 포인터 + WM_POINTER → Sample   (input, digitizer)
 ② CanvasTool     [UI]    Sample → 획 + 라이브 기하            (tool)
 ③ Canvas         [UI]    상태만: 획 목록 · 구운 접두사 · 꼬리   (canvas)
 ④ Render         [UI]    Canvas → WinUI 트리(키 diff)        (render)
@@ -68,10 +72,11 @@ crates/light-note-gui    윈도우 11 전용 앱 (WinUI 3 호스트 + 엔진)
 cargo test -p light-note-gui
 ```
 
-53개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
+70개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
 
-- `pipeline` — ①표본 정규화(표면 DIP → pt) ②드래그 하나 = 편집 하나·취소는 흔적 없음
-  ③꼬리는 **구운 접두사 뒤에서 시작**·낡은 응답은 버려짐·예산이 상한 ④화면 계획
+- `pipeline` — ①표본 정규화(표면 DIP → pt)·**펜 프레임**(장치·필압·틸트, 낡은 프레임은 버림)
+  ②드래그 하나 = 편집 하나·취소는 흔적 없음·**펜만 필기**(마우스·손가락은 무시)·**필압이
+  속도를 이긴다** ③꼬리는 **구운 접두사 뒤에서 시작**·낡은 응답은 버려짐·예산이 상한 ④화면 계획
 - `geometry` — **라이브 도형과 래스터가 같은 픽셀인가**(곡선/가변폭/점/형광펜 4종, 바이트
   비교), 관절을 덮는 확장 규칙, 관절에서 알파가 두 번 곱해지지 않는가
 - `document` — Undo/Redo(지우개 드래그 = 편집 하나, 페이지 편집도 한 편집), 히스토리 한계,
@@ -209,6 +214,13 @@ cargo run   -p light-note-gui --release
 7. **포인터는 `Border`** — `windows-reactor` 0.100에서 포인터 이벤트는 `Border`에만 있다.
    `Canvas`는 절대 좌표 배치, `Image`는 베이스 전용이다.
 8. **입력은 메시지 큐를 거쳐** 처리된다(Reactor의 이벤트 FIFO) — elm의 "이벤트 = 할당"과 맞는다.
+9. **필기 자격은 시간이 아니라 장치가 정한다** — WinUI는 장치를 알려주지 않으므로 앱 창을
+   서브클래스해 Win32 `WM_POINTER`를 **관찰만** 하고(`DefSubclassProc`으로 그대로 넘긴다),
+   `GetPointerType`이 `PT_PEN`인 동안만 잉크가 된다(`tool::CanvasTool::accepts`). 손가락·마우스는
+   **무시**하고 취소하지 않는다 — 손바닥이 닿았다고 진행 중인 펜 획을 버리면 필기가 안 된다.
+   필압(0~1024)·틸트(-90~90도)는 `GetPointerPenInfo`에서 오고, 장치가 안 보내면(`penMask`)
+   속도 기반으로 돌아간다. 프레임에는 **50ms TTL**이 있다 — 펜을 뗀 뒤 온 표본에 펜 자격이
+   붙으면 거짓이기 때문이다(`input::FRAME_TTL_MS`).
 
 ## 알아둘 한계 (어댑터/런타임 사실)
 
@@ -230,8 +242,20 @@ cargo run   -p light-note-gui --release
   폭이 변하는 획은 화면과 **같은 합집합**(늘린 사각형 + 둥근 캡)을 한 번 채운다(관절 얼룩 없음).
 - **배경에 없는 페이지를 가리키면 내보내기가 실패한다** — 조용히 흰 종이로 넘어가지 않는다.
   이유를 말하고 멈추는 편이 "왜 빈 페이지가 나왔지"를 만드는 것보다 낫다.
-- **필압**: `PointerEventInfo`에 압력이 없어 **속도로 굵기를 만든다**(`pressure_from_speed`).
-  펜 태블릿 압력은 어댑터가 이벤트를 확장해야 한다.
+- **필압·틸트는 Win32 `WM_POINTER`에서 온다**: `PointerEventInfo`에는 장치도 압력도 없어서
+  앱 창을 서브클래스해 `GetPointerPenInfo`로 읽는다(압력 0~1024 → 0~1, 틸트 -90~90도). 장치가
+  압력을 보고하지 않으면(`penMask`) **속도로 굵기를 만든다**(`pressure_from_speed`). 틸트는
+  지금 굵기에 쓰지 않는다 — 값은 표본에 실려 있고(상태바가 "필압·틸트 사용 중"으로 확인해 준다)
+  도형 결정이 필요해지면 거기서 꺼내 쓴다.
+- **디지타이저(펜)만 필기한다**: 손가락·마우스는 화면을 만질 수는 있어도 **획을 만들지 않는다**.
+  게이트는 `GetPointerType`이 `PT_PEN`인 프레임이라 펜이 눌린 동안만 잉크가 되고 손바닥은
+  무시된다(진행 중인 펜 획은 죽지 않는다). **마우스는 `WM_POINTER`로 오지 않으므로**(프레임이
+  없다 = 마우스) 원격 데스크톱·가상 머신처럼 디지타이저가 없는 환경에서는 **필기가 되지
+  않는다** — 사고가 아니라 정책이고, 상태바가 이유를 말한다(훅이 안 걸렸으면
+  `digitizer::state().reason()`, 펜을 아직 못 봤으면 "아직 펜이 감지되지 않았습니다").
+- **창 핸들은 리액터가 공개하지 않는다**: `digitizer`가 `GetActiveWindow` → 이 스레드의 가장 큰
+  보이는 창 순으로 **찾아서** 서브클래스를 건다. 창을 못 찾으면 `HookState::NoWindow`가 남고
+  상태바가 그 사실을 말한다(조용히 안 그려지는 일이 없다).
 - **단축키**: `AcceleratorKey`가 `R`, NumPad, `Add`/`Subtract`, `Enter`만 지원한다 →
   `Ctrl+더하기/빼기`(줌), `Ctrl+Enter`(페이지 추가)만 붙였다. 그래서 같은 동작을
   **툴바 버튼**으로도 제공한다.

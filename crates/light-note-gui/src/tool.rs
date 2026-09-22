@@ -1,7 +1,8 @@
 //! ② CanvasTool — ①의 입력을 **잉크 결정**으로 바꾸는 유일한 곳.
 //!
-//! 도구가 정하는 것: 어떤 스타일로 긋는가, 압력(속도 기반), 그리고 **드래그가 문서에
-//! 언제 반영되는가**.
+//! 도구가 정하는 것: **무엇이 잉크가 되는가**([`CanvasTool::accepts`] — 디지타이저만),
+//! 어떤 스타일로 긋는가, 압력(**하드웨어 필압이 있으면 그것, 없으면 속도**), 그리고
+//! **드래그가 문서에 언제 반영되는가**.
 //!
 //! - 그리는 중인 획은 **문서에 들어가지 않는다** — ②가 들고 있다가 손을 떼는 순간
 //!   [`Doc::commit_stroke`]로 확정한다. 그래서 페이지에는 언제나 **확정된 획만** 있다.
@@ -15,6 +16,7 @@ use std::time::Instant;
 use crate::doc::{Doc, Edit};
 use crate::geom::{Pt, Scale};
 use crate::ink::{pressure_from_speed, InkPoint, Stroke, Style, Tool, MIN_SAMPLE_DISTANCE_PT};
+use crate::input::Device;
 use crate::shape::LiveInk;
 
 /// 진행 중인 제스처 — 확정 전의 편집 하나.
@@ -66,6 +68,15 @@ impl CanvasTool {
     pub const ERASER_RADIUS_PT: f32 = 14.0;
     /// 굵기 한 단계.
     pub const WIDTH_STEP: f32 = 1.25;
+
+    /// **필기 정책 — 디지타이저(펜)만 잉크가 된다.**
+    ///
+    /// 이 앱은 드로잉 패드 친화 필기 앱이라 손가락·마우스는 **아무것도 만들지 않는다**
+    /// (화면을 만질 수는 있어도 획은 안 생긴다). 장치 판정은 ①이 한다([`Device`]) —
+    /// ②는 그 판정을 **정책으로** 적용하는 곳이다.
+    pub const fn accepts(device: Device) -> bool {
+        matches!(device, Device::Pen)
+    }
 
     pub fn new() -> Self {
         Self::default()
@@ -122,7 +133,16 @@ impl CanvasTool {
     /// 손을 댔다 — 새 획을 시작하거나 지우개 드래그를 시작한다.
     ///
     /// 이전 제스처가 남아 있으면 먼저 버린다(포인터 캡처가 유실됐던 경우).
+    /// 하드웨어 필압이 없으면([`None`]) 첫 점은 온전한 폭으로 시작한다.
     pub fn press(&mut self, doc: &mut Doc, at: Pt, now: Instant) {
+        self.press_with(doc, at, now, None);
+    }
+
+    /// 손을 댔다 — **하드웨어 필압을 들고 오는 경로**(디지타이저).
+    ///
+    /// `pressure`가 `Some`이면 그것이 이 획의 시작 굵기다: 필압은 **장치가 아는 사실**이고
+    /// 속도 추정은 대체값이기 때문이다.
+    pub fn press_with(&mut self, doc: &mut Doc, at: Pt, now: Instant, pressure: Option<f32>) {
         self.cancel(doc);
         self.last = Some((at, now));
         let page = doc.active_index();
@@ -134,14 +154,29 @@ impl CanvasTool {
             self.gesture = Some(Gesture::Erase { page, removed });
             return;
         }
+        let first = match pressure {
+            Some(pressure) => InkPoint::new(at, pressure),
+            None => InkPoint::at(at),
+        };
         self.gesture = Some(Gesture::Draw {
-            stroke: Stroke::new(self.state.tool, self.style, InkPoint::at(at)),
+            stroke: Stroke::new(self.state.tool, self.style, first),
         });
     }
 
     /// 손을 움직였다. **무언가 바뀌었으면 `true`**(③이 라이브를 다시 계산한다).
     pub fn drag(&mut self, doc: &mut Doc, at: Pt, now: Instant) -> bool {
-        let pressure = self.pressure(at, now);
+        self.drag_with(doc, at, now, None)
+    }
+
+    /// 손을 움직였다 — **하드웨어 필압을 들고 오는 경로**(디지타이저).
+    pub fn drag_with(
+        &mut self,
+        doc: &mut Doc,
+        at: Pt,
+        now: Instant,
+        pressure: Option<f32>,
+    ) -> bool {
+        let pressure = self.pressure(at, now, pressure);
         match self.gesture.as_mut() {
             Some(Gesture::Draw { stroke }) => stroke.push(InkPoint::new(at, pressure)),
             Some(Gesture::Erase { page, removed }) => {
@@ -206,9 +241,15 @@ impl CanvasTool {
             .map(|stroke| crate::shape::live_ink(stroke, scale))
     }
 
-    /// 속도 → 압력. 표본 간격이 없으면(첫 점) 온전한 압력.
-    fn pressure(&mut self, at: Pt, now: Instant) -> f32 {
-        let Some((previous, then)) = self.last.replace((at, now)) else {
+    /// 압력의 **출처는 하나**다: 하드웨어가 보고했으면 그것(디지타이저), 아니면 속도 추정.
+    ///
+    /// 어느 쪽이든 `last`는 갱신한다 — 펜을 떼고 마우스로 이어 그어도 속도 계산이 튀지 않게.
+    fn pressure(&mut self, at: Pt, now: Instant, hardware: Option<f32>) -> f32 {
+        let previous = self.last.replace((at, now));
+        if let Some(pressure) = hardware {
+            return pressure.clamp(0.0, 1.0);
+        }
+        let Some((previous, then)) = previous else {
             return InkPoint::DEFAULT_PRESSURE;
         };
         let millis = now.saturating_duration_since(then).as_secs_f32() * 1000.0;

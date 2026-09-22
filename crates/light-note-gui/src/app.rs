@@ -1,11 +1,17 @@
 //! 셸(호스트) — **4단계를 순서대로 부르는 유일한 곳**.
 //!
 //! ```text
-//! Pointer(phase,x,y)  → ① input::sample   → ② tool.press/drag/lift   → ③ canvas.refresh → ④ 발행
+//! Pointer(phase,x,y,frame) → ① input::sample_with → ② tool.press/drag/lift → ③ refresh → ④ 발행
 //! Intent(intent)      → ② 도구/문서 명령   → ③ canvas.edit / go_to_page / step_zoom → ④ 발행
 //! Baked(result)       → (④-워커 결과)      → ③ canvas.accept(디코드 신호 대기)
 //! Decoded(index)      → (ImageOpened)     → ③ canvas.promote → ④ 발행
 //! ```
+//!
+//! ## 필기 정책 — **디지타이저(펜)만** 잉크가 된다
+//! `Pointer`의 프레임은 ①-하드웨어([`digitizer`])가 Win32 `WM_POINTER`에서 읽은 것이다.
+//! 시작(`Pressed`)과 진행(`Moved`)은 **펜일 때만** ②로 넘어가고, 손가락·마우스는 무시한다.
+//! **무시하지 취소하지 않는다** — 손바닥이 닿았다고 진행 중인 펜 획을 버리면 필기가 안 된다.
+//! 끝(`Released`/`Canceled`)은 장치와 무관하게 전달한다(커밋할 제스처는 펜이 시작한 것뿐이다).
 //!
 //! ## UI 스레드에서 하는 일 (R1 — 페이지 크기에 비례하는 일은 없다)
 //! - 포인터 표본 하나: ② O(1) + ③ 진행 중 획 하나 갱신 + ④ 도형 만들기(예산 안).
@@ -29,6 +35,7 @@ use elm_magic_windows_reactor::{ElmInput, ElmView};
 use windows_reactor::{Component, ComponentContext, View, ViewContext};
 
 use crate::canvas::{BakeResult, Canvas};
+use crate::digitizer;
 use crate::export::{self, EXPORT_SCALE};
 use crate::files::{self, OpenedFile};
 use crate::geom::Size;
@@ -42,8 +49,8 @@ use crate::ui::{self, Frame, Intent, Screen, ScreenProps, Stage, ViewModel};
 /// 호스트 메시지 — `spawn_background`가 돌려주므로 **`Send`**여야 한다.
 #[derive(Clone, Debug)]
 pub enum HostMessage {
-    /// ① 입력 — 표면 DIP 좌표 + 위상.
-    Pointer(Phase, f64, f64),
+    /// ① 입력 — 표면 DIP 좌표 + 위상 + **하드웨어 프레임**(펜이면 장치·필압·틸트).
+    Pointer(Phase, f64, f64, Option<input::PointerFrame>),
     /// elm 화면의 의도.
     Intent(Intent),
     /// ④-워커가 구운 베이스.
@@ -83,7 +90,7 @@ impl Component for Shell {
             pdf: None,
             pdf_bytes: None,
             stage: Stage::Empty,
-            status: "새 노트 — 펜으로 그려 보세요".to_string(),
+            status: "새 노트 — 펜(디지타이저)으로 그려 보세요".to_string(),
             baking: None,
         };
         shell.refresh(context);
@@ -91,8 +98,10 @@ impl Component for Shell {
     }
 
     fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
+        // 창이 첫 발행보다 늦게 생길 수 있다 — 메시지마다 한 번 더 시도한다(이미 걸렸으면 공짜다).
+        digitizer::install();
         match message {
-            HostMessage::Pointer(phase, x, y) => self.pointer(phase, x, y),
+            HostMessage::Pointer(phase, x, y, frame) => self.pointer(phase, x, y, frame),
             HostMessage::Intent(intent) => self.intent(intent, context),
             HostMessage::Baked(result) => self.adopt_bake(result),
             HostMessage::Decoded(_) => {
@@ -115,6 +124,9 @@ impl Component for Shell {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+        // ①-하드웨어: Win32 `WM_POINTER` 훅을 건다(창이 아직 없으면 다음 프레임에 다시 시도한다).
+        digitizer::install();
+
         // 창 제목은 호스트가 정한다(elm은 플랫폼을 모른다 — 예제 20).
         context.window_title(format!("light-note — {}", self.canvas.doc().title()));
 
@@ -123,7 +135,9 @@ impl Component for Shell {
         // ① 포인터 → 메시지 큐. 표면 빌더가 이 싱크를 **캡처**한다(예제 08).
         let pointer_sender = sender.clone();
         let sink: input::InputSink = Rc::new(move |phase, x, y| {
-            let _ = pointer_sender.send(HostMessage::Pointer(phase, x, y));
+            // 이벤트 **순간**의 펜 프레임을 붙인다 — 큐를 거친 뒤에 읽으면 이미 낡았다.
+            let frame = digitizer::latest();
+            let _ = pointer_sender.send(HostMessage::Pointer(phase, x, y, frame));
         });
 
         // ④ 디코드 완료 → 앞자리 교체. **이 신호 뒤에만** 화면이 바뀐다(빈 프레임 없음).
@@ -162,15 +176,35 @@ impl Shell {
     // ── ① → ② (포인터) ──────────────────────────────────────────────
 
     /// 포인터 한 점 — ①이 pt로 바꾸고 ②가 잉크로 만든다.
-    fn pointer(&mut self, phase: Phase, x: f64, y: f64) {
-        let sample = input::sample(phase, x, y, self.canvas.scale());
+    fn pointer(&mut self, phase: Phase, x: f64, y: f64, frame: Option<input::PointerFrame>) {
+        let sample = input::sample_with(phase, x, y, self.canvas.scale(), frame);
+
+        // **필기 정책**: 시작과 진행은 디지타이저(펜)만 한다. 손가락·마우스는 무시한다 —
+        // 취소하지 않는 이유는 손바닥이 닿았다고 진행 중인 펜 획을 버리면 안 되기 때문이다.
+        // 끝(`is_end`)은 장치와 무관하게 전달한다: 커밋할 제스처는 펜이 시작한 것뿐이다.
+        if !sample.phase.is_end() && !CanvasTool::accepts(sample.device()) {
+            self.reject(sample);
+            return;
+        }
+
         match sample.phase {
-            Phase::Pressed => self
-                .tool
-                .press(self.canvas.doc_mut(), sample.at, sample.now),
+            Phase::Pressed => {
+                self.tool.press_with(
+                    self.canvas.doc_mut(),
+                    sample.at,
+                    sample.now,
+                    sample.pressure(),
+                );
+                self.status = Self::pen_status(sample);
+            }
             Phase::Moved => {
                 if self.tool.is_active() {
-                    self.tool.drag(self.canvas.doc_mut(), sample.at, sample.now);
+                    self.tool.drag_with(
+                        self.canvas.doc_mut(),
+                        sample.at,
+                        sample.now,
+                        sample.pressure(),
+                    );
                 }
             }
             Phase::Released => match self.tool.lift(self.canvas.doc_mut()) {
@@ -191,6 +225,39 @@ impl Shell {
                     self.status = "획을 취소했습니다".to_string();
                 }
             }
+        }
+    }
+
+    /// 필기가 아닌 입력 — **아무것도 만들지 않고** 이유를 상태바에 남긴다.
+    ///
+    /// 진행(`Moved`)마다 쓰면 상태바가 시끄러우므로 **시작(`Pressed`)에서만** 말한다.
+    fn reject(&mut self, sample: input::Sample) {
+        if sample.phase != Phase::Pressed {
+            return;
+        }
+        let state = digitizer::state();
+        self.status = if !state.is_hooking() {
+            // 훅이 안 걸렸으면 **그것이** 필기가 안 되는 이유다 — 정직하게 말한다.
+            state.reason().to_string()
+        } else if digitizer::seen_pen() {
+            format!(
+                "{} 입력 — 이 앱은 펜(디지타이저)으로만 필기합니다",
+                sample.device().label()
+            )
+        } else {
+            format!(
+                "{} 입력 — 펜(디지타이저)으로만 필기합니다. 아직 펜이 감지되지 않았습니다",
+                sample.device().label()
+            )
+        };
+    }
+
+    /// 펜으로 시작한 획의 한 줄 — **필압이 오는지**를 화면에서 확인할 수 있게.
+    fn pen_status(sample: input::Sample) -> String {
+        match (sample.pressure(), sample.tilt()) {
+            (Some(_), Some(_)) => "펜 — 필압·틸트 사용 중".to_string(),
+            (Some(_), None) => "펜 — 필압 사용 중 (틸트 미지원)".to_string(),
+            _ => "펜 — 필압을 보고하지 않는 장치 (속도로 굵기)".to_string(),
         }
     }
 

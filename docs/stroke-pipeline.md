@@ -11,8 +11,8 @@ scale = Scale::DEFAULT(1.5) × zoom/100        // 1pt = scale 픽셀
 ## 30초 요약
 
 ```text
-[UI ①] 포인터 눌림 ──▶ tool.press()  → ② 진행 중 획 (O(1))
-       이동       ──▶ tool.drag()   → shape::live_ink(획) ──▶ WinUI Line+Ellipse
+[UI ①] 포인터 눌림 ──▶ tool.press_with()  → ② 진행 중 획 (O(1))
+       이동       ──▶ tool.drag_with()   → shape::live_ink(획) ──▶ WinUI Line+Ellipse
                                                               (즉시, 600점 0.1ms)
        뗌         ──▶ tool.lift() = Edit::AddStroke (커밋)
                         │
@@ -46,8 +46,8 @@ scale = Scale::DEFAULT(1.5) × zoom/100        // 1pt = scale 픽셀
 | ③ 캔버스 | 문서 + **구운 접두사**(`Base`) + **꼬리**(`Rc<[LiveInk]>`) | `src/canvas.rs` |
 | 모델 | 페이지·획·Undo/Redo | `src/doc.rs`, `src/ink.rs` |
 | 기하/래스터 | 도형 결정(`ink_shape`) + 픽셀화 | `src/shape.rs` |
-| 입력 | 표면 DIP → pt, 위상 | `src/input.rs` |
-| 도구 | press/drag/lift/cancel, 속도→압력 | `src/tool.rs` |
+| 입력 | 표면 DIP → pt, 위상, **장치·필압·틸트** | `src/input.rs`, `src/digitizer.rs` |
+| 도구 | press/drag/lift/cancel, **펜만 필기**, 압력(필압, 없으면 속도) | `src/tool.rs` |
 
 **스레드 2개만 있다**: UI 스레드(= Reactor 메시지 루프 + elm 프레임)와 백그라운드 워커
 (`context.spawn_background`). 워커로 가는 것은 **`Send`인 스냅샷**뿐이고(획 목록 복사, PNG 바이트),
@@ -68,7 +68,8 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 
 | # | 하는 일 | 왜 |
 |---|---|---|
-| ① | 포인터 싱크 등록 — `Rc<dyn Fn(phase,x,y)>`가 `HostMessage::Pointer`를 큐에 넣는다 | 포인터 이벤트는 `Border`에만 있고, 표면 빌더가 이 싱크를 **캡처**한다(예제 08) |
+| ⓪ | `digitizer::install()` — 앱 창을 찾아 `WM_POINTER` 서브클래스를 건다(`view()`/`update()`에서 매번 시도) | 창이 아직 없으면 다음 기회에 다시 시도한다(여러 번 불러도 한 번만 걸린다) |
+| ① | 포인터 싱크 등록 — `Rc<dyn Fn(phase,x,y)>`가 **이벤트 순간의 펜 프레임**을 붙여 `HostMessage::Pointer`를 큐에 넣는다 | 포인터 이벤트는 `Border`에만 있고, 표면 빌더가 이 싱크를 **캡처**한다(예제 08) |
 | ② | 디코드 싱크 등록 — `ImageOpened` → `HostMessage::Decoded(index)` | **승격의 유일한 신호** |
 | ③ | 가속기 등록 → 같은 큐 | `Ctrl +/-`, `Ctrl+Enter`만 지원(어댑터 한계) |
 | ④ | `ui::stage_frame(self.canvas.frame())` | `<Raw>` 클로저는 props/슬롯을 못 본다 — 발행 직전에 재료를 넣는다 |
@@ -94,27 +95,37 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 ### T0 — 포인터 눌림 (`Pressed`)
 
 ```text
+WM_POINTERDOWN → GetPointerType → GetPointerPenInfo   src/digitizer.rs (창 서브클래스, 관찰만)
+  └ LATEST(스레드 로컬) = PointerFrame { device, pressure, tilt }
 Border.on_pointer_pressed(info)                     src/render.rs
-  └ InputSink(Pressed, info.x, info.y) → LocalSender → HostMessage::Pointer
+  └ InputSink(Pressed, info.x, info.y) → LocalSender → HostMessage::Pointer   ← 프레임을 붙인다
       └ Shell::pointer()                            src/app.rs
-           sample = input::sample(Pressed, x, y, canvas.scale())   // ① 표면 DIP → pt
-           tool.press(canvas.doc_mut(), sample.at, sample.now)     // ② 진행 중 획
+           sample = input::sample_with(Pressed, x, y, canvas.scale(), frame)   // ① DIP → pt + 장치
+           CanvasTool::accepts(sample.device())?        // **펜만 통과** — 아니면 상태바에 이유
+           tool.press_with(canvas.doc_mut(), sample.at, sample.now, sample.pressure())  // ② 진행 중 획
 ```
 
 - 포인터 이벤트는 **동기 처리가 아니다**: Reactor의 이벤트 FIFO를 거쳐 `update()`에서 돈다.
   그래서 `update()` 안에서 오래 걸리는 일(래스터)을 하면 **그 프레임이 통째로 멈춘다**.
 - ①은 곱셈 하나다: `Pt = (x / scale, y / scale)`. 페이지 크기와 무관하다(R1).
 - ②는 O(1)이다 — 획 하나(점 하나)를 만들 뿐이다.
-- 압력은 `PointerEventInfo`에 없어서 **속도로 만든다**: `pressure_from_speed(pt/ms)` → 빠르면
-  가늘고 느리면 굵다. 폭은 `Style::width_at(pressure) = width_pt × (0.45 + 0.55 × pressure)`.
+- **필기 자격은 장치가 정한다**: `WM_POINTER`를 읽어 `PT_PEN`일 때만 잉크가 되고, 손가락·마우스는
+  무시한다(취소하지 않는다 — 손바닥이 닿았다고 펜 획을 버리면 필기가 안 된다). 끝(`Released`/
+  `Canceled`)은 장치와 무관하게 전달한다: 커밋할 제스처는 펜이 시작한 것뿐이다.
+- 압력은 **하드웨어가 보고하면 그것**(`GetPointerPenInfo`, 0~1024 → 0~1), 아니면 **속도로
+  만든다**: `pressure_from_speed(pt/ms)` → 빠르면 가늘고 느리면 굵다. 폭은
+  `Style::width_at(pressure) = width_pt × (0.45 + 0.55 × pressure)`.
+- 프레임은 **이벤트 순간**의 것만 쓴다(`FRAME_TTL_MS = 50`): 펜을 뗀 뒤 온 표본에 펜 자격이
+  붙으면 장치도 압력도 거짓이 된다.
 - **접두사는 손대지 않는다** — 진행 중 획은 꼬리가 그린다.
 
 ### T1 — 포인터 이동 (`Moved`) = 필기 중 매 프레임
 
 ```text
-tool.drag(canvas.doc_mut(), sample.at, sample.now)    src/tool.rs → src/doc.rs
+tool.drag_with(canvas.doc_mut(), sample.at, sample.now, sample.pressure())   src/tool.rs → src/doc.rs
   · 최소 간격(0.6pt)보다 가깝고 압력 차도 작으면 **버린다**(모델을 가볍게 유지)
-  · 속도 기반 압력이라 "가깝지만 압력이 다르다"는 표본은 남는다 → 폭이 변하는 획이 흔하다
+  · 필압이 오면 그대로 쓰고, 없으면 속도 추정이라 "가깝지만 압력이 다르다"는 표본이 남는다
+    → 폭이 변하는 획이 흔하다
 
 canvas.refresh(tool.drawing())                        src/canvas.rs
   ├ 꼬리: tail_dirty/꼬리 시작·길이가 어긋났을 때만 **다시 계산**(보통은 그대로)

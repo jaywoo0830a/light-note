@@ -1,12 +1,16 @@
 //! light-note-gui — **윈도우 11 전용** 필기 앱. 하나의 크레이트, 하나의 파이프라인(4단계).
 //!
 //! ```text
-//! ① HardwareInput  [UI]   WinUI 포인터 → Sample            (input)
+//! ① HardwareInput  [UI]   WinUI 포인터 + Win32 WM_POINTER → Sample   (input, digitizer)
 //! ② CanvasTool     [UI]   Sample → 획 + 라이브 기하         (tool)
 //! ③ Canvas         [UI]   상태만: 획 목록 · 구운 접두사 · 안 구운 꼬리  (canvas)
 //! ④ Render         [UI]   Canvas → WinUI 트리(키 diff)      (render)
 //!                  [워커] Canvas 스냅샷 → 픽스맵+PNG          ← 페이지 크기 작업은 여기서만
 //! ```
+//!
+//! **디지타이저(펜)만 필기한다**: 드로잉 패드 친화 필기 앱이라 손가락·마우스는 잉크를
+//! 만들지 않는다([`tool::CanvasTool::accepts`]). 장치 판정은 Win32 `WM_POINTER`를 읽는
+//! [`digitizer`]가 하고(필압·틸트도 거기서 온다), WinUI는 장치를 알려주지 않는다.
 //!
 //! 규칙은 셋뿐이고, 그 셋이 이 크레이트의 계약이다:
 //!
@@ -33,6 +37,7 @@
 
 pub mod app;
 pub mod canvas;
+pub mod digitizer;
 pub mod doc;
 pub mod export;
 pub mod files;

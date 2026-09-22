@@ -17,6 +17,22 @@ pdf-writer.workspace = true
 windows-reactor.workspace = true
 rfd.workspace = true
 
+# Win32 `WM_POINTER` — 디지타이저(펜) 장치·필압·틸트를 읽는다(digitizer 모듈).
+#
+# **대상 게이트가 필요하다**: `windows` 크레이트는 Windows 대상에서만 컴파일된다.
+# 그래서 계획(plan) 층만 도는 다른 플랫폼에서도 `cargo test`가 살아 있고, 필기 정책
+# (`tool::CanvasTool::accepts`)과 프레임 계약(`input::PointerFrame`)은 플랫폼과 무관하게
+# 테스트된다 — Win32 코드는 `digitizer::win32`(cfg(windows))에만 있다.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [[bin]]
 name = "light-note-gui"
 path = "src/main.rs"
