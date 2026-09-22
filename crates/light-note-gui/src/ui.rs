@@ -55,6 +55,10 @@ pub enum Intent {
     CloseHelp,
     /// 페이지 목록에서 고른 페이지 — 툴바 버튼이 아니라 **레일의 줄**이 보낸다.
     GoToPage(usize),
+    /// **개발자 도구** 열기/닫기 — 디지타이저 진단(툴바의 마지막 버튼).
+    ToggleDev,
+    /// 개발자 도구의 **리스캔** — 창을 다시 찾아 훅을 건다.
+    Rescan,
 }
 
 impl Intent {
@@ -86,12 +90,20 @@ impl Intent {
         &[Intent::ZoomOut, Intent::ZoomIn],
     ];
 
+    /// **개발자 도구**의 의도 — 화면(툴바의 진단 버튼 + 진단 패널)이 보낸다.
+    ///
+    /// 사용자용 기능이 아니라 **진단**이다: 필기가 안 될 때 어느 관문에서 막혔는지 보여주고,
+    /// 창을 다시 찾는 버튼을 준다(`digitizer::Digest`). 툴바의 버튼 줄이 아니라 **미리보기 줄**에
+    /// 앉는다: 버튼 줄은 라벨 폭이 이미 한 줄 한계에 가까워서(라벨 12개) 하나를 더 넣으면
+    /// 좁은 창에서 잘린다.
+    pub const DEV: [Intent; 2] = [Intent::ToggleDev, Intent::Rescan];
+
     /// 화면(조각)이 보낼 수 있는 의도 **전부** — `CloseHelp`는 Esc 전용,
     /// `GoToPage`는 페이지 목록의 줄 전용(값을 들고 온다)이라 여기 없다.
     ///
     /// 의도를 늘리면 [`Intent::label`]의 전수 match가 컴파일을 멈춘다 — 그때 여기 넣을지,
-    /// 툴바/레일에 넣을지를 정한다(`tests/ui_plan.rs`가 셋을 서로 맞춰 본다).
-    pub const CHROME: [Intent; 19] = [
+    /// 툴바/레일/개발자 도구에 넣을지를 정한다(`tests/ui_plan.rs`가 셋을 서로 맞춰 본다).
+    pub const CHROME: [Intent; 21] = [
         Intent::Pen,
         Intent::Highlighter,
         Intent::Eraser,
@@ -111,6 +123,8 @@ impl Intent {
         Intent::ZoomOut,
         Intent::Retry,
         Intent::ToggleHelp,
+        Intent::ToggleDev,
+        Intent::Rescan,
     ];
 
     /// 버튼 라벨이자 테스트가 읽는 이름 — UI와 테스트가 **같은 문자열**을 쓴다.
@@ -138,6 +152,8 @@ impl Intent {
             Intent::Retry => "Retry",
             Intent::ToggleHelp => "Keyboard shortcuts",
             Intent::CloseHelp => "Close shortcuts",
+            Intent::ToggleDev => "Diagnostics",
+            Intent::Rescan => "Rescan windows",
             Intent::GoToPage(_) => "Go to page",
         }
     }
@@ -219,6 +235,11 @@ pub struct ViewModel {
     pub input: String,
     /// 단축키 패널이 열려 있는가 — **호스트가 소유**한다(화면은 그리기만 한다).
     pub help: bool,
+    /// **개발자 도구**(디지타이저 진단)가 열려 있는가 — 호스트가 소유한다.
+    pub dev: bool,
+    /// 진단 줄 — `(이름, 값)` 쌍. 문장은 **호스트가 만들고**(`digitizer::Digest::report`)
+    /// 조각은 표로 그리기만 한다: 진단이 화면 언어 규칙을 조각 밖에서 지킨다.
+    pub diag: Vec<(String, String)>,
     /// 창의 클라이언트 크기 (DIP) — 잉크 영역이 창 안에 들어오게 하는 **유일한 근거**다.
     ///
     /// elm 트리는 `StackPanel`뿐이라 자식 높이가 묶이지 않는다(종이가 창보다 크면
@@ -248,6 +269,8 @@ impl Default for ViewModel {
             status: String::new(),
             input: String::new(),
             help: false,
+            dev: false,
+            diag: Vec::new(),
             viewport: (1280.0, 800.0),
             page_labels: Vec::new(),
         }
@@ -342,6 +365,8 @@ pub enum Part {
     Failure,
     /// 단축키 패널(호스트가 열고 닫는다).
     Shortcuts,
+    /// **개발자 도구** — 디지타이저 진단 표 + 리스캔(호스트가 열고 닫는다).
+    DevTools,
 }
 
 /// 의도를 호스트로 보내는 통로 — 조각이 만든 **버튼이 이것을 캡처**한다.
@@ -523,6 +548,15 @@ elm_magic::view! {
 }
 
 elm_magic::view! {
+    /// 개발자 도구 — 디지타이저 진단 표 + 리스캔(호스트가 `view.dev`로 연다).
+    pub fn DevTools() {
+        <Raw>|out: &mut SurfaceSlot| {
+            *out = part(Part::DevTools);
+        }</Raw>
+    }
+}
+
+elm_magic::view! {
     /// 잉크 표면 — 종이 + (빈 상태 안내). **잉크 영역 전체**가 이 조각이다.
     ///
     /// 클로저 토큰은 매크로가 그대로 삽입하므로 props/슬롯 이름을 쓸 수 없다 — 재료(프레임)와
@@ -568,6 +602,12 @@ elm_magic::view! {
             // 본문 **위**에 둔다: 아래에 두면 잉크 영역 높이 추정이 틀릴 때 화면 밖으로
             // 밀려 아무도 못 본다(추정이 틀리면 잘리는 것은 본문 아래쪽뿐이어야 한다).
             <Status />
+
+            // ── 개발자 도구 (조각): 디지타이저 진단 — **필기가 안 될 때 여기** ──
+            // 정보 띠와 같은 이유로 본문 **위**에 둔다(진단은 필요할 때 보여야 한다).
+            <If when={view.dev}>
+                <DevTools />
+            </If>
 
             // ── 본문: 레일(조각) + 잉크 표면(조각) ─────────────
             <Row>

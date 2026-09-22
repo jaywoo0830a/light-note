@@ -33,8 +33,18 @@
 //!   그 사실을 [`state`]로 남기고 상태바가 "왜 안 그려지는지"를 말한다.
 //! - **마우스는 여기로 오지 않는다**(`WM_MOUSE*`) — 그래서 마우스로는 **필기할 수 없다**.
 //!   원격 데스크톱·가상 머신처럼 디지타이저가 없는 환경도 같다(사고가 아니라 정책이다).
+//!
+//! ## 안 될 때 **어디를 보는가** (개발자 도구)
+//! 필기는 세 관문을 다 지나야 성립한다: ①시스템에 펜이 있는가 ②우리가 **메시지를 받는 창**에
+//! 훅을 걸었는가 ③그 창으로 펜 메시지가 오는가. 하나라도 막히면 잉크가 안 나오는데, 화면에는
+//! 그 이유가 없다 — 그래서 이 모듈이 [`Digest`]를 열어 두고 툴바의 진단 도구가 그대로 보여준다.
+//!
+//! 관문 ②가 함정이다: WinUI 3의 창은 **하나가 아니다**. 최상위 앱 창 안에 콘텐츠를 담는
+//! **자식 창**(site bridge)이 따로 있고 포인터는 자식으로 온다. 그래서 [`rescan`]은 최상위 창의
+//! 자식까지 **전부** 걸고, 창마다 몇 개가 도착했는지([`Probe::messages`])를 센다 —
+//! 어느 창에 걸어야 했는가가 숫자로 드러난다.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crate::input::{Device, PointerFrame};
 
@@ -76,6 +86,20 @@ thread_local! {
     static SEEN_PEN: Cell<bool> = const { Cell::new(false) };
     /// 설치 상태.
     static STATE: Cell<HookState> = const { Cell::new(HookState::Idle) };
+    /// 모든 창을 합친 `WM_POINTER*` 메시지 수 — **아직 아무것도 안 왔는가**의 근거다.
+    static MESSAGES: Cell<u32> = const { Cell::new(0) };
+    /// 찾은 창들 — 창 프로시저가 자기 자리를 **인덱스로** 찾는다(참조 데이터).
+    static PROBES: RefCell<Vec<Slot>> = const { RefCell::new(Vec::new()) };
+    /// 시스템 디지타이저 — 창과 무관하므로 한 번 읽으면 된다.
+    static DIGITIZER: Cell<Digitizer> = const {
+        Cell::new(Digitizer {
+            present: false,
+            integrated_pen: false,
+            external_pen: false,
+            integrated_touch: false,
+            ready: false,
+        })
+    };
 }
 
 /// 설치 상태 — 설치가 안 됐으면 **필기가 안 되는 이유**가 여기 있다.
@@ -93,9 +117,259 @@ pub fn seen_pen() -> bool {
     SEEN_PEN.get()
 }
 
-/// 앱 창을 찾아 서브클래스를 건다 — **여러 번 불러도 한 번만** 걸린다(`view()`/`update()`가 매번 부른다).
+// ── 진단 (개발자 도구가 읽는다) ────────────────────────────────────
+
+/// 시스템이 보고하는 **디지타이저 종류** — `GetSystemMetrics(SM_DIGITIZER)`의 플래그.
+///
+/// 이 값이 **먼저**다: 펜이 없는 기계라면 훅이 아무리 잘 걸려도 필기는 안 된다. 진단 도구가
+/// 첫 줄에서 하드웨어가 문제인지 우리가 문제인지를 가른다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Digitizer {
+    /// 태블릿 입력이 하나라도 있는가.
+    pub present: bool,
+    /// 내장 펜(노트북에 붙은 펜).
+    pub integrated_pen: bool,
+    /// 외장 펜(드로잉 패드).
+    pub external_pen: bool,
+    /// 손가락 터치.
+    pub integrated_touch: bool,
+    /// 드라이버가 준비됐는가.
+    pub ready: bool,
+}
+
+impl Digitizer {
+    /// 펜이 하나라도 있는가 — **필기가 가능한 기계인가**의 답.
+    pub const fn has_pen(self) -> bool {
+        self.integrated_pen || self.external_pen
+    }
+
+    /// 진단 줄에 쓸 한 줄(**영어만**) — 펜이 없으면 그 사실이 맨 앞에 온다.
+    pub fn summary(self) -> String {
+        if !self.present {
+            return "none reported — this system has no tablet input".to_string();
+        }
+        let mut kinds: Vec<&str> = Vec::new();
+        if self.integrated_pen {
+            kinds.push("integrated pen");
+        }
+        if self.external_pen {
+            kinds.push("external pen");
+        }
+        if self.integrated_touch {
+            kinds.push("touch");
+        }
+        if kinds.is_empty() {
+            kinds.push("tablet input, but no pen");
+        }
+        let ready = if self.ready {
+            ""
+        } else {
+            " (driver not ready)"
+        };
+        format!("{}{ready}", kinds.join(" · "))
+    }
+}
+
+/// 창 하나의 **관측 기록** — 어느 창으로 입력이 오는가를 눈으로 보기 위한 것.
+///
+/// WinUI 3의 창은 하나가 아니다: 최상위 앱 창과 그 안의 자식 콘텐츠 창이 따로 있다. 창마다
+/// [`Probe::messages`]를 세면 **어디에 걸어야 했는가**가 숫자로 드러난다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probe {
+    /// 창 핸들 — 진단 줄에 16진수로 찍는다.
+    pub hwnd: isize,
+    /// 창 클래스 이름(예: `Microsoft.UI.Content.DesktopChildSiteBridge`).
+    pub class: String,
+    /// 창 제목(보통 빈 문자열이다).
+    pub title: String,
+    /// 보이는 창인가.
+    pub visible: bool,
+    /// 클라이언트 크기 (px).
+    pub size: (i32, i32),
+    /// 서브클래스가 걸렸는가.
+    pub hooked: bool,
+    /// 이 창이 받은 `WM_POINTER*` 메시지 수.
+    pub messages: u32,
+    /// 그중 **펜**이었던 수.
+    pub pen: u32,
+}
+
+impl Probe {
+    /// 진단 줄의 **이름** — 클래스 이름 + 핸들.
+    pub fn name(&self) -> String {
+        let class = if self.class.is_empty() {
+            "(no class name)"
+        } else {
+            self.class.as_str()
+        };
+        format!("{class}  {:#x}", self.hwnd)
+    }
+
+    /// 진단 줄의 **값** — 크기 · 표시 · 훅 · 도착한 메시지.
+    pub fn detail(&self) -> String {
+        let (width, height) = self.size;
+        let visible = if self.visible { "visible" } else { "hidden" };
+        let hooked = if self.hooked { "hooked" } else { "not hooked" };
+        format!(
+            "{width}×{height} · {visible} · {hooked} · msgs {} · pen {}",
+            self.messages, self.pen
+        )
+    }
+}
+
+/// 지금 이 순간의 진단 — 화면이 그대로 올리는 값(문장은 [`Digest::report`]가 만든다).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Digest {
+    /// 훅 설치 상태.
+    pub state: HookState,
+    /// 펜 프레임을 한 번이라도 받았는가.
+    pub seen_pen: bool,
+    /// 모든 창을 합친 `WM_POINTER*` 메시지 수.
+    pub messages: u32,
+    /// 찾은 창들(걸린 것과 못 걸린 것 모두).
+    pub probes: Vec<Probe>,
+    /// 마지막 펜 프레임.
+    pub last: Option<PointerFrame>,
+    /// 마지막 프레임이 몇 ms 전인가.
+    pub last_age_ms: Option<u64>,
+    /// 시스템 디지타이저.
+    pub digitizer: Digitizer,
+}
+
+impl Digest {
+    /// 진단 줄 — `(이름, 값)` 쌍. **영어만** 쓴다(화면 언어 규칙).
+    ///
+    /// 순수 함수라 WinUI 없이 테스트된다: 이 줄들이 곧 무엇을 보고 판단할 것인가다.
+    pub fn report(&self) -> Vec<(String, String)> {
+        let mut rows = vec![
+            ("System digitizer".to_string(), self.digitizer.summary()),
+            ("Hook".to_string(), self.hook_summary()),
+            ("Pen frames".to_string(), self.pen_summary()),
+            ("WM_POINTER messages".to_string(), self.messages.to_string()),
+            ("Last frame".to_string(), self.frame_summary()),
+        ];
+        if self.probes.is_empty() {
+            rows.push((
+                "Windows".to_string(),
+                "none found on this thread".to_string(),
+            ));
+        }
+        // 펜이 없는 기계라면 그 사실이 **결론**이다 — 아래 숫자는 볼 필요도 없다.
+        if !self.digitizer.has_pen() {
+            rows.push((
+                "Hint".to_string(),
+                "ink needs a pen digitizer — mouse and touch never draw".to_string(),
+            ));
+        }
+        for probe in &self.probes {
+            rows.push((probe.name(), probe.detail()));
+        }
+        rows
+    }
+
+    /// 관문 ② — 훅이 어디까지 갔는가.
+    fn hook_summary(&self) -> String {
+        let hooked = self.probes.iter().filter(|probe| probe.hooked).count();
+        match self.state {
+            HookState::Hooking => format!("hooked on {hooked} of {} window(s)", self.probes.len()),
+            HookState::Idle => "not tried yet".to_string(),
+            HookState::NoWindow => "no app window found — still looking".to_string(),
+            HookState::Failed => "the window refused the subclass".to_string(),
+        }
+    }
+
+    /// 관문 ③ — 펜 메시지가 도착했는가(안 왔으면 **어디까지 왔는지**를 말한다).
+    fn pen_summary(&self) -> String {
+        if self.seen_pen {
+            "yes — the digitizer reported a pen".to_string()
+        } else if self.messages > 0 {
+            "no — messages arrived, none of them a pen".to_string()
+        } else {
+            "no — no pointer message has arrived at all".to_string()
+        }
+    }
+
+    /// 마지막 프레임 한 줄 — 장치 · 필압 · 틸트 · 나이.
+    fn frame_summary(&self) -> String {
+        let Some(frame) = self.last else {
+            return "none yet".to_string();
+        };
+        let mut text = frame.device.label().to_string();
+        if let Some(pressure) = frame.pressure {
+            text.push_str(&format!(" · pressure {pressure:.2}"));
+        }
+        if let Some((x, y)) = frame.tilt {
+            text.push_str(&format!(" · tilt {x:.0}/{y:.0}"));
+        }
+        if let Some(age) = self.last_age_ms {
+            text.push_str(&format!(" · {age} ms ago"));
+        }
+        text
+    }
+}
+
+/// 지금 이 순간의 진단 — 개발자 도구가 읽는다(**UI 스레드 전용**).
+pub fn digest() -> Digest {
+    let last = latest();
+    Digest {
+        state: state(),
+        seen_pen: seen_pen(),
+        messages: MESSAGES.get(),
+        probes: probes(),
+        last,
+        last_age_ms: last.map(|frame| frame.at.elapsed().as_millis() as u64),
+        digitizer: DIGITIZER.get(),
+    }
+}
+
+/// 창을 **다시 찾아** 아직 안 걸린 창에 서브클래스를 건다 — 개발자 도구의 리스캔.
+///
+/// 리액터는 HWND를 공개하지 않으므로 창 찾기는 추측이다. 늦게 생긴 창(자식 콘텐츠 창)을 줍기
+/// 위해 다시 부를 수 있게 열어 둔다 — 카운터는 **지우지 않는다**(무엇이 왔는지가 정보다).
+pub fn rescan() {
+    #[cfg(windows)]
+    win32::rescan();
+}
+
+/// 창 목록의 **복사본** — 스레드 로컬을 오래 붙들지 않는다(창 프로시저가 거기에 더한다).
+fn probes() -> Vec<Probe> {
+    PROBES.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .map(|slot| Probe {
+                hwnd: slot.hwnd,
+                class: slot.class.clone(),
+                title: slot.title.clone(),
+                visible: slot.visible,
+                size: slot.size,
+                hooked: slot.hooked,
+                messages: slot.messages.get(),
+                pen: slot.pen.get(),
+            })
+            .collect()
+    })
+}
+
+/// 스레드 로컬 원본 — 카운터가 `Cell`이라 **창 프로시저가 빌림 없이** 더한다.
+struct Slot {
+    hwnd: isize,
+    class: String,
+    title: String,
+    visible: bool,
+    size: (i32, i32),
+    hooked: bool,
+    messages: Cell<u32>,
+    pen: Cell<u32>,
+}
+
+/// 앱 창을 찾아 서브클래스를 건다 — `view()`/`update()`가 매번 부른다(**공짜여야 한다**).
+///
+/// **펜을 한 번 볼 때까지** 다시 찾는다: WinUI 3의 자식 콘텐츠 창은 앱 창보다 늦게 생길 수 있고,
+/// 그 창을 빠뜨리면 훅이 최상위 창에만 걸려 **아무 메시지도 못 본다**(필기가 안 되는 대표 사고다).
+/// 펜을 봤으면 그만 찾는다 — 열거와 이름 읽기는 공짜가 아니다.
 pub fn install() {
-    if state().is_hooking() {
+    if seen_pen() {
         return;
     }
     #[cfg(windows)]
@@ -104,75 +378,176 @@ pub fn install() {
 
 #[cfg(windows)]
 mod win32 {
+    use std::cell::Cell;
     use std::time::Instant;
 
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
     use windows::Win32::UI::Input::Pointer::{GetPointerPenInfo, GetPointerType, POINTER_PEN_INFO};
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumThreadWindows, GetClientRect, IsWindowVisible, PEN_MASK_PRESSURE, PEN_MASK_TILT_X,
-        PEN_MASK_TILT_Y, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, WM_POINTERDOWN, WM_POINTERUP,
+        EnumChildWindows, EnumThreadWindows, GetClassNameW, GetClientRect, GetSystemMetrics,
+        GetWindowTextW, IsWindowVisible, NID_EXTERNAL_PEN, NID_INTEGRATED_PEN,
+        NID_INTEGRATED_TOUCH, NID_READY, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
+        POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, SM_DIGITIZER, WM_POINTERDOWN, WM_POINTERUP,
         WM_POINTERUPDATE,
     };
 
-    use super::{Device, HookState, LATEST, SEEN_PEN, STATE};
+    use super::{
+        Device, Digitizer, HookState, Slot, DIGITIZER, LATEST, MESSAGES, PROBES, SEEN_PEN, STATE,
+    };
     use crate::input::{self, PointerFrame};
 
     /// comctl32 서브클래스 식별자 — 한 창에 여러 서브클래스가 붙으므로 우리 것에 이름을 준다.
     const SUBCLASS_ID: usize = 0x4C4E_5054; // "LNPT"
     /// pointer id는 `wParam`의 **하위 워드**다(`GET_POINTERID_WPARAM`).
     const POINTER_ID_MASK: usize = 0xFFFF;
+    /// 창 클래스 이름/제목 버퍼 길이 — 256이면 어떤 WinUI 창 이름도 들어간다.
+    const CLASS_NAME_MAX: usize = 256;
 
-    /// 창을 찾아 서브클래스를 건다(실패해도 이유만 남기고 앱은 계속 돈다).
+    /// 창을 찾아 **아직 안 걸린 창 전부**에 서브클래스를 건다(실패해도 이유만 남기고 앱은 돈다).
     pub(super) fn install() {
-        let Some(hwnd) = app_window() else {
-            STATE.set(HookState::NoWindow);
-            return;
-        };
-        let hooked = unsafe { SetWindowSubclass(hwnd, Some(pointer_proc), SUBCLASS_ID, 0) };
-        STATE.set(if hooked.0 != 0 {
-            HookState::Hooking
-        } else {
-            HookState::Failed
-        });
+        rescan();
     }
 
-    /// 이 스레드의 앱 창 — 리액터는 HWND를 공개하지 않으므로 **찾는다**.
-    ///
-    /// ① 이 스레드의 활성 창이 있으면 그것(대부분 이 경우다),
-    /// ② 없으면 이 스레드의 최상위 창 중 **가장 큰 보이는 창**.
-    /// 앱은 창이 하나뿐이라 이 둘로 충분하다.
-    fn app_window() -> Option<HWND> {
-        let active = unsafe { GetActiveWindow() };
-        if !active.is_invalid() {
-            return Some(active);
+    /// 다시 찾아 **새로 생긴 창**까지 건다 — 카운터는 지우지 않는다(무엇이 왔는지가 정보다).
+    pub(super) fn rescan() {
+        // 디지타이저 종류는 창과 무관하다 — 볼 때마다 새로 읽어도 싸다(진단 첫 줄의 근거).
+        DIGITIZER.set(read_digitizer());
+
+        let mut hooked = 0usize;
+        for hwnd in candidates() {
+            if hook(hwnd) {
+                hooked += 1;
+            }
         }
-        let mut best: Option<(HWND, i64)> = None;
+        if hooked > 0 {
+            STATE.set(HookState::Hooking);
+        } else if !super::state().is_hooking() {
+            // 이번에도 못 걸었다 — 이유를 남긴다(창이 아예 없으면 NoWindow).
+            let found = PROBES.with(|slots| !slots.borrow().is_empty());
+            STATE.set(if found {
+                HookState::Failed
+            } else {
+                HookState::NoWindow
+            });
+        }
+    }
+
+    /// 창 하나에 서브클래스를 건다 — **이미 걸었으면 건너뛴다**(같은 창에 두 번 걸면 정의되지 않는다).
+    ///
+    /// 참조 데이터로 **목록의 인덱스**를 넘긴다: 창 프로시저가 자기 카운터를 찾는 유일한 길이다.
+    fn hook(hwnd: HWND) -> bool {
+        let Some((index, already)) = remember(hwnd) else {
+            return false;
+        };
+        if already {
+            return true;
+        }
+        let hooked = unsafe { SetWindowSubclass(hwnd, Some(pointer_proc), SUBCLASS_ID, index) };
+        if hooked.0 == 0 {
+            return false;
+        }
+        PROBES.with(|slots| {
+            if let Some(slot) = slots.borrow_mut().get_mut(index) {
+                slot.hooked = true;
+            }
+        });
+        true
+    }
+
+    /// 창을 목록에 **기억한다** — 처음 보면 넣고, 아는 창이면 크기·표시 여부만 새로 읽는다.
+    fn remember(hwnd: HWND) -> Option<(usize, bool)> {
+        let (visible, size) = read_shape(hwnd);
+        PROBES.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            if let Some(index) = slots.iter().position(|slot| slot.hwnd == hwnd.0 as isize) {
+                let slot = &mut slots[index];
+                slot.visible = visible;
+                slot.size = size;
+                return Some((index, slot.hooked));
+            }
+            slots.push(Slot {
+                hwnd: hwnd.0 as isize,
+                class: read_class(hwnd),
+                title: read_title(hwnd),
+                visible,
+                size,
+                hooked: false,
+                messages: Cell::new(0),
+                pen: Cell::new(0),
+            });
+            Some((slots.len() - 1, false))
+        })
+    }
+
+    /// 후보 창 — 이 스레드의 최상위 창 **+ 그 자식 전부**(자식 콘텐츠 창이 여기 있다).
+    ///
+    /// 거르지 않는다: **어느 창으로 입력이 오는지는 걸어 봐야 안다**. 그래서 창마다 도착 수를
+    /// 세고([`Slot::messages`]), 진단 도구가 그 표를 그대로 보여준다.
+    fn candidates() -> Vec<HWND> {
+        let mut found: Vec<HWND> = Vec::new();
         unsafe {
             let _ = EnumThreadWindows(
                 GetCurrentThreadId(),
-                Some(collect_largest),
-                LPARAM((&raw mut best) as isize),
+                Some(collect),
+                LPARAM((&raw mut found) as isize),
             );
         }
-        best.map(|(hwnd, _)| hwnd)
-    }
-
-    /// 열거 콜백 — **가장 큰 보이는 창**을 고른다(창이 하나면 그것이 곧 앱 창이다).
-    unsafe extern "system" fn collect_largest(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let best = unsafe { &mut *(lparam.0 as *mut Option<(HWND, i64)>) };
-        let mut rect = RECT::default();
-        let visible = unsafe { IsWindowVisible(hwnd) }.0 != 0;
-        if visible && unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
-            let area = i64::from(rect.right - rect.left) * i64::from(rect.bottom - rect.top);
-            if best.is_none_or(|(_, best_area)| area > best_area) {
-                *best = Some((hwnd, area));
+        // 열거 중에 자식을 더하므로 **복사본**을 돌린다(같은 목록을 돌며 늘리면 끝이 없다).
+        for top in found.clone() {
+            unsafe {
+                let _ =
+                    EnumChildWindows(Some(top), Some(collect), LPARAM((&raw mut found) as isize));
             }
         }
+        found
+    }
+
+    /// 열거 콜백 — 모으기만 한다.
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+        found.push(hwnd);
         BOOL(1) // 계속 열거한다.
+    }
+
+    /// 창 클래스 이름 — 진단에서 **어느 창인지**를 가르는 이름이다.
+    fn read_class(hwnd: HWND) -> String {
+        let mut buffer = [0u16; CLASS_NAME_MAX];
+        let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+    }
+
+    /// 창 제목(보통 빈 문자열이다) — 있으면 클래스 이름보다 잘 읽힌다.
+    fn read_title(hwnd: HWND) -> String {
+        let mut buffer = [0u16; CLASS_NAME_MAX];
+        let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+    }
+
+    /// 표시 여부 + 클라이언트 크기 (px).
+    fn read_shape(hwnd: HWND) -> (bool, (i32, i32)) {
+        let visible = unsafe { IsWindowVisible(hwnd) }.0 != 0;
+        let mut rect = RECT::default();
+        let size = if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
+            (rect.right - rect.left, rect.bottom - rect.top)
+        } else {
+            (0, 0)
+        };
+        (visible, size)
+    }
+
+    /// 시스템 디지타이저 — `SM_DIGITIZER`의 플래그를 이름 있는 값으로 나눈다.
+    fn read_digitizer() -> Digitizer {
+        let flags = unsafe { GetSystemMetrics(SM_DIGITIZER) } as u32;
+        Digitizer {
+            present: flags != 0,
+            integrated_pen: flags & NID_INTEGRATED_PEN != 0,
+            external_pen: flags & NID_EXTERNAL_PEN != 0,
+            integrated_touch: flags & NID_INTEGRATED_TOUCH != 0,
+            ready: flags & NID_READY != 0,
+        }
     }
 
     /// 창 프로시저 — `WM_POINTER*`를 **읽고 그대로 넘긴다**(입력을 소비하지 않는다).
@@ -182,16 +557,27 @@ mod win32 {
         wparam: WPARAM,
         lparam: LPARAM,
         _id: usize,
-        _data: usize,
+        data: usize,
     ) -> LRESULT {
         if matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP) {
-            record((wparam.0 & POINTER_ID_MASK) as u32);
+            count(data);
+            record(data, (wparam.0 & POINTER_ID_MASK) as u32);
         }
         unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
     }
 
+    /// 이 창이 메시지를 받았다 — **어느 창으로 오는가**가 진단의 답이다(참조 데이터 = 목록 인덱스).
+    fn count(index: usize) {
+        MESSAGES.set(MESSAGES.get().wrapping_add(1));
+        PROBES.with(|slots| {
+            if let Some(slot) = slots.borrow().get(index) {
+                slot.messages.set(slot.messages.get().wrapping_add(1));
+            }
+        });
+    }
+
     /// pointer id 하나를 프레임으로 — **여기가 하드웨어와 모델의 경계**다.
-    fn record(id: u32) {
+    fn record(index: usize, id: u32) {
         let mut kind = POINTER_INPUT_TYPE::default();
         let device = match unsafe { GetPointerType(id, &mut kind) } {
             Ok(()) if kind == PT_PEN => Device::Pen,
@@ -200,6 +586,12 @@ mod win32 {
         };
         let (pressure, tilt) = if device == Device::Pen {
             SEEN_PEN.set(true);
+            // 진단: **어느 창으로 펜이 왔는가**(창마다 세면 훅 자리가 드러난다).
+            PROBES.with(|slots| {
+                if let Some(slot) = slots.borrow().get(index) {
+                    slot.pen.set(slot.pen.get().wrapping_add(1));
+                }
+            });
             pen_info(id)
         } else {
             (None, None)

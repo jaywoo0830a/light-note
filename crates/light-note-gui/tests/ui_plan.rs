@@ -45,6 +45,8 @@ fn view(tool: Tool, stage: Stage) -> ViewModel {
         status: "Untitled · page 1 / 1 · 0 strokes".to_string(),
         input: "Pen — digitizer active".to_string(),
         help: false,
+        dev: false,
+        diag: Vec::new(),
         viewport: (1280.0, 800.0),
         page_labels: vec![page_label(0, 0)],
     }
@@ -82,6 +84,7 @@ fn the_chrome_definition_covers_every_intent_once() {
         .flat_map(|group| group.iter().copied())
         .chain(Intent::RAIL.iter().flat_map(|group| group.iter().copied()))
         .chain([Intent::Retry])
+        .chain(Intent::DEV)
         .collect();
     assert_eq!(
         flat.len(),
@@ -216,6 +219,25 @@ fn the_shortcut_panel_follows_the_host_flag() {
     open.help = true;
     let (_, pass) = plan_of(open);
     assert_eq!(pass.count("Raw"), CHROME_RAW + 2, "단축키 패널이 더 있다");
+
+    let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "닫혀 있으면 자리도 없다");
+}
+
+#[test]
+fn the_dev_panel_follows_the_host_flag() {
+    // 개발자 도구도 **호스트가 소유**한다(`view.dev`) — elm은 자리만 정한다.
+    let mut open = view(Tool::Pen, Stage::Ready);
+    open.dev = true;
+    open.diag = vec![("Hook".to_string(), "hooked on 1 of 1 window(s)".to_string())];
+    let (node, pass) = plan_of(open);
+    assert_eq!(pass.count("Raw"), CHROME_RAW + 2, "진단 패널이 더 있다");
+    let kinds: Vec<&str> = node.children.iter().map(|child| child.control()).collect();
+    assert_eq!(
+        kinds,
+        vec!["Raw", "Raw", "Raw", "Raw", "StackPanel"],
+        "진단 패널은 정보 띠와 본문 **사이**에 선다(본문 아래면 잘려 안 보인다)"
+    );
 
     let (_, pass) = plan_of(view(Tool::Pen, Stage::Ready));
     assert_eq!(pass.count("Raw"), CHROME_RAW + 1, "닫혀 있으면 자리도 없다");

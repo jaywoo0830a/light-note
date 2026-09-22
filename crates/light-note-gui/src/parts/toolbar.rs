@@ -34,7 +34,7 @@ use crate::ui::{Intent, IntentSink, ViewModel};
 /// 툴바 하나 — 버튼 줄(창 폭에 따라 1~2줄) + 잉크 미리보기 줄.
 pub fn toolbar(view: &ViewModel, sink: &IntentSink) -> RawSlot {
     let mut rows: Vec<View> = button_rows(view, sink);
-    rows.push(row(TOKENS.gap, preview(view)));
+    rows.push(row(TOKENS.gap, preview(view, sink)));
 
     // 줄을 **쌓는다**(세로 `StackPanel`): Grid의 열 정의·정렬은 이 백엔드에서 폭을 못 받아
     // 자식이 사라진다(`parts::row` 참고). 줄 사이 간격도 리듬 토큰이다.
@@ -98,7 +98,10 @@ fn tool_of(intent: Intent) -> Option<Tool> {
 ///
 /// 막대는 알약(`pill`)이다: 둥근 캡을 가진 잉크와 같은 모양이고 좌표가 필요 없다.
 /// 굵기가 상자 높이를 넘으면 **자른다**(넘치면 조용히 잘리기 때문이다).
-fn preview(view: &ViewModel) -> Vec<View> {
+///
+/// 줄 끝에 **개발자 도구** 버튼이 붙는다(진단) — 버튼 줄이 아니라 여기인 이유는
+/// [`Intent::DEV`]의 주석에 있다(버튼 줄은 라벨 폭이 이미 한계다).
+fn preview(view: &ViewModel, sink: &IntentSink) -> Vec<View> {
     let ink = Style::for_tool(view.tool);
     let thickness = (view.width_pt as f64).clamp(1.0, TOKENS.line_max);
     let alpha = f64::from(ink.color.a) / 255.0;
@@ -127,5 +130,8 @@ fn preview(view: &ViewModel) -> Vec<View> {
         label("Ink", TOKENS.caption, FontWeight::SEMI_BOLD).into(),
         swatch,
         meta(format!("{} · {:.1} pt", view.tool_label(), view.width_pt)).into(),
+        // **개발자 도구** 버튼 — 여기(미리보기 줄)에 앉는다: 버튼 줄은 라벨 12개로 이미
+        // 한 줄 한계에 가까워 하나를 더 넣으면 좁은 창에서 잘린다(`Intent::DEV`의 주석).
+        buttons::labeled_button(Intent::ToggleDev, sink),
     ]
 }

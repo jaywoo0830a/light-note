@@ -27,6 +27,7 @@
 //! [`HostMessage`]는 `Send`여야 한다(`spawn_background` 요구). 그래서 **PDF 문서를 메시지에
 //! 넣지 않는다** — 워커가 필요하면 바이트에서 다시 파싱한다.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -91,6 +92,13 @@ pub struct Shell {
     status: String,
     /// 단축키 패널이 열려 있는가 — **호스트가 소유**한다(조각이 그리기만 한다).
     help: bool,
+    /// **개발자 도구**(디지타이저 진단)가 열려 있는가 — 이것도 호스트가 소유한다.
+    dev: bool,
+    /// WinUI 표면이 받은 포인터 이벤트 수 — **훅과 UI 경로를 가르는 숫자**다.
+    ///
+    /// 디지타이저 훅이 죽어 있어도 표면에는 이벤트가 온다. 이 수가 0이면 문제는 훅이 아니라
+    /// UI 경로다(진단 표의 첫 줄이 이 값을 말한다).
+    ui_events: Rc<Cell<u64>>,
     /// 창의 클라이언트 크기 (DIP) — 잉크 영역 높이의 근거(관측이 오기 전에는 기본값).
     viewport: (f64, f64),
     /// 끌어놓기 안내를 띄우기 **전의** 상태 문구 — 나가면 이 값으로 되돌린다.
@@ -112,6 +120,8 @@ impl Component for Shell {
             stage: Stage::Empty,
             status: "New note — draw with a pen (digitizer)".to_string(),
             help: false,
+            dev: false,
+            ui_events: Rc::new(Cell::new(0)),
             viewport: (1280.0, 800.0),
             status_before_drop: None,
             baking: None,
@@ -190,7 +200,10 @@ impl Component for Shell {
 
         // ① 포인터 → 메시지 큐. 표면 빌더가 이 싱크를 **캡처**한다(예제 08).
         let pointer_sender = sender.clone();
+        let ui_events = Rc::clone(&self.ui_events);
         let sink: input::InputSink = Rc::new(move |phase, x, y| {
+            // 진단: WinUI 경로가 살아 있는가 — 훅이 죽어도 이 수는 는다.
+            ui_events.set(ui_events.get().wrapping_add(1));
             // 이벤트 **순간**의 펜 프레임을 붙인다 — 큐를 거친 뒤에 읽으면 이미 낡았다.
             let frame = digitizer::latest();
             let _ = pointer_sender.send(HostMessage::Pointer(phase, x, y, frame));
@@ -443,6 +456,13 @@ impl Shell {
             Intent::ZoomOut => self.step_zoom(false),
             Intent::ToggleHelp => self.help = !self.help,
             Intent::CloseHelp => self.help = false,
+            // **개발자 도구** — 여는 것만 한다(표는 다음 발행에서 채워진다: `view_model`).
+            Intent::ToggleDev => self.dev = !self.dev,
+            Intent::Rescan => {
+                // 창을 **다시 찾는다**: 늦게 생긴 자식 창(콘텐츠 창)을 줍는 길이다.
+                digitizer::rescan();
+                self.status = "Rescanned windows for pen input".to_string();
+            }
             Intent::GoToPage(index) => {
                 // 레일에서 고른 페이지 — 페이지 이동은 접두사를 무효로 만든다(③이 안다).
                 if self.canvas.go_to_page(index) {
@@ -532,6 +552,8 @@ impl Shell {
             status: self.status.clone(),
             input: self.input_badge(),
             help: self.help,
+            dev: self.dev,
+            diag: self.diagnostics(),
             viewport: self.viewport,
             page_labels: doc
                 .pages()
@@ -540,6 +562,21 @@ impl Shell {
                 .map(|(index, page)| ui::page_label(index, page.stroke_count()))
                 .collect(),
         }
+    }
+
+    /// 개발자 도구에 올릴 **진단 표** — 문장은 여기서 만든다(조각은 표만 그린다).
+    ///
+    /// 첫 줄은 WinUI 쪽 사실이다: 디지타이저 훅이 죽어 있어도 **표면에는 이벤트가 온다** —
+    /// 그 수가 0이면 문제는 훅이 아니라 UI 경로다(둘을 가르는 유일한 근거).
+    fn diagnostics(&self) -> Vec<(String, String)> {
+        let digest = digitizer::digest();
+        let last = digest.last.map_or("none", |frame| frame.device.label());
+        let mut rows = vec![(
+            "WinUI pointer events".to_string(),
+            format!("{} (last device frame: {last})", self.ui_events.get()),
+        )];
+        rows.extend(digest.report());
+        rows
     }
 }
 

@@ -50,6 +50,8 @@ pub fn symbol(intent: Intent) -> Symbol {
         Intent::Retry => Symbol::Refresh,
         Intent::ToggleHelp => Symbol::Help,
         Intent::CloseHelp => Symbol::Cancel,
+        Intent::ToggleDev => Symbol::Repair,
+        Intent::Rescan => Symbol::Refresh,
         Intent::GoToPage(_) => Symbol::Page,
     }
 }

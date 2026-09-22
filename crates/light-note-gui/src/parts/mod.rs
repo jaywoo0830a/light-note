@@ -16,6 +16,7 @@
 //! | 여는 중 | `loading` | `loading::loading` | `<Loading />` |
 //! | 실패 | `failure` | `failure::failure` | `<Failure />` |
 //! | 단축키 패널 | `shortcuts` | `shortcuts::shortcuts` | `<Shortcuts />` |
+//! | 개발자 도구(진단) | `devtools` | `devtools::devtools` | `<DevTools />` |
 //! | 잉크 종이 | `paper` | `paper::frame` | `<InkSurface />`(render가 부른다) |
 //! | 버튼 어휘 | `buttons` | `buttons::icon_button` | (조각들이 쓴다) |
 //!
@@ -36,6 +37,7 @@
 //! 컨트롤을 조용히 넘치거나 자른다.
 
 pub mod buttons;
+pub mod devtools;
 pub mod empty;
 pub mod failure;
 pub mod loading;
@@ -69,6 +71,7 @@ pub fn build(part: Part, view: &ViewModel, sink: &IntentSink) -> RawSlot {
         Part::Loading => loading::loading(),
         Part::Failure => failure::failure(view, sink),
         Part::Shortcuts => shortcuts::shortcuts(),
+        Part::DevTools => devtools::devtools(view, sink),
     }
 }
 

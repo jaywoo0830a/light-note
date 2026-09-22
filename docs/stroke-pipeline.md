@@ -69,7 +69,8 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 
 | # | 하는 일 | 왜 |
 |---|---|---|
-| ⓪ | `digitizer::install()` — 앱 창을 찾아 `WM_POINTER` 서브클래스를 건다(`view()`/`update()`에서 매번 시도) | 창이 아직 없으면 다음 기회에 다시 시도한다(여러 번 불러도 한 번만 걸린다) |
+| ⓪ | `digitizer::install()` — 이 스레드의 **모든** 창(최상위 + 자식 콘텐츠 창)에 `WM_POINTER` 서브클래스를 건다(`view()`/`update()`가 매번 부른다) | **펜 프레임을 한 번 볼 때까지** 다시 찾는다: WinUI 3의 자식 창이 늦게 생기면 최상위 창만 걸어서는 메시지가 **하나도** 안 온다. 이미 건 창은 건너뛴다 |
+| ⓪-b | 개발자 도구(`view.dev`) — `digitizer::Digest::report()`가 만든 표를 `parts::devtools`가 그린다 | 필기가 안 되면 화면에 이유가 없다: **세 관문**(펜 하드웨어 · 훅이 걸린 창 · 도착한 펜 메시지)과 창마다의 도착 수를 보여주고, 리스캔 버튼이 늦게 생긴 창을 줍는다 |
 | ① | 포인터 싱크 등록 — `Rc<dyn Fn(phase,x,y)>`가 **이벤트 순간의 펜 프레임**을 붙여 `HostMessage::Pointer`를 큐에 넣는다 | 포인터 이벤트는 `Border`에만 있고, 표면 빌더가 이 싱크를 **캡처**한다(예제 08) |
 | ② | 디코드 싱크 등록 — `ImageOpened` → `HostMessage::Decoded(index)` | **승격의 유일한 신호** |
 | ③ | 가속기 등록 → 같은 큐 | `Ctrl +/-`, `Ctrl+Enter`만 지원(어댑터 한계) |
@@ -385,6 +386,8 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app
 | F1/Esc가 **의도로** 호스트에 간다(elm은 상태를 소유하지 않는다) | `ui_plan::the_f1_and_escape_keys_send_intents` |
 | 표면은 `<Raw>` **하나**로 붙고 재료가 그대로 도착 | `ui_plan::the_surface_reaches_the_registered_builder_through_one_raw_slot` |
 | 화면 언어는 **영어만** | `ui_plan::every_visible_string_is_english_only` |
+| 진단 표가 **세 관문**을 정확히 말한다(펜 유무·창별 도착 수·훅 상태) | `digitizer::*` |
+| 진단 패널은 정보 띠와 본문 **사이**에 선다(아래면 잘려 안 보인다) | `ui_plan::the_dev_panel_follows_the_host_flag` |
 | 토큰 규칙(4 DIP 리듬·타이포 내림차순·알약 관례·컨트롤 눈금) | `style::*` |
 | 인코딩 계약(BOM·UTF-8·CRLF) | `encoding::*` |
 
