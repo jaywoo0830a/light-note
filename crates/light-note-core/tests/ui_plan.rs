@@ -251,13 +251,7 @@ fn surface_data_reaches_the_registered_builder_through_raw() {
     let size = Size::new(200.0, 100.0);
     let view = NoteViewModel::from_document(&Document::blank(size), Tool::Pen, 1.8, 100.0);
     let surface = InkSurface::build(size, 1.5, &[], None);
-    stage_surface(SurfaceData {
-        png: None,
-        lines: surface.lines.clone(),
-        width: surface.width,
-        height: surface.height,
-        scale: surface.scale,
-    });
+    stage_surface(SurfaceData::from_surface(&surface));
 
     let mut ctx = Ctx::new();
     let tree = elm_magic::frame::<NoteApp>(

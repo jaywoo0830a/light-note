@@ -4,8 +4,11 @@
 //! Grid            가속기만 담는다 (Ctrl+더하기/빼기/Enter)
 //! └ Border        **포인터 이벤트는 Border에만 있다** + 종이 배경
 //!   └ Canvas      절대 좌표 컨테이너 (CanvasChildExt)
-//!     ├ Image     정적 레이어: 확정 스트로크 PNG (투명)
-//!     └ Line…     라이브 레이어: 진행 중인 획의 선분들
+//!     ├ Image #0  정적 레이어 A: 확정 스트로크 PNG (투명) — 보이는 쪽만 종이 위(0,0)
+//!     ├ Image #1  정적 레이어 B: 더블 버퍼의 뒤 (창 밖으로 밀어 둔다 = 안 보임)
+//!     └ Canvas…   라이브 획 **하나** = 한 합성 그룹 (Opacity = 색의 알파)
+//!       ├ Line…   몸통 — 구간(또는 곡선을 편 직선 조각)
+//!       └ Ellipse… 둥근 캡 (WinUI `Line`에는 캡 속성이 없다)
 //! ```
 //!
 //! ## windows-reactor 0.100.0의 사실에 맞춘 이유
@@ -17,21 +20,29 @@
 //! - **`Canvas`가 유일한 절대 좌표 컨테이너**다(`CanvasChildExt::canvas_left/canvas_top`).
 //! - **가속기는 `Grid`에만 붙는다**(`Grid::key_accelerators`). 높이가 내용만큼이라
 //!   레이아웃에 영향을 주지 않는다.
+//! - **`Line`에는 캡/조인 속성이 없고 `Path`/`Polyline`은 아예 없다** — 그래서 라이브 도형은
+//!   직선 조각(`Line`) + 둥근 캡(`Ellipse`)이고, 관절은 사각형을 반지름만큼 늘려 덮는다
+//!   (코어의 `raster::extended_span`). 래스터도 같은 도형을 채우므로 **승격 순간에 잉크의
+//!   모양이 바뀌지 않는다**(테스트가 픽셀로 확인: 차이 0.000%).
 //! - 확정 레이어는 **드래그가 끝날 때만** 다시 만들어지고(코어의 [`InkSurface`] 계약),
-//!   라이브 레이어는 선분 몇 개만 갱신된다 — 잉크가 쌓여도 입력 지연이 늘지 않는다.
+//!   라이브 레이어는 도형 몇 개만 갱신된다 — 잉크가 쌓여도 입력 지연이 늘지 않는다.
 //! - 그 "다시 만들기"는 **백그라운드**에서 돈다(호스트가 코어의 `surface::static_layer`를
-//!   워커에 맡기고 결과를 `SurfaceData::png`로 받는다). 렌더가 도착하기 전까지 방금 확정한
-//!   획은 `data.lines`(라이브 레이어)에 남는다 — 그래서 획을 끝내도 화면이 멈추지 않는다.
+//!   워커에 맡기고 결과를 `SurfaceData`로 받는다). 렌더가 도착하기 전까지 방금 확정한
+//!   획은 `data.ink`(라이브 레이어)에 남는다 — 그래서 획을 끝내도 화면이 멈추지 않는다.
+//! - 정적 레이어는 **두 장(더블 버퍼)**이고, 새 PNG는 **보이지 않는 뒤 레이어**(창 밖)에
+//!   올라간다. 뒤 레이어의 디코드가 끝나면(`on_opened`) 호스트가 앞뒤를 바꾼다 —
+//!   어댑터가 소스를 비우고 비동기로 디코드하는 사이 화면이 비는 일이 **구조적으로 없다**.
 
 use std::rc::Rc;
 
 use elm_magic_windows_reactor::RawSlot;
-use light_note_core::surface::SurfaceLine;
+use light_note_core::surface::{LiveStroke, StaticLayers, SurfaceCap, SurfaceLine};
 use light_note_core::ui::SurfaceData;
 use windows_reactor::{
     AcceleratorKey, AcceleratorModifiers, Border, Brush, Canvas, CanvasChildExt, ChildrenControl,
-    Color, ContentControl, CornerRadius, EncodedImage, Grid, Image, KeyAccelerator, KeyAccelerators,
-    KeyedView, LayoutControl, Line, PointerEventInfo, Stretch, ThemeBrush, Thickness,
+    Color, ContentControl, CornerRadius, Ellipse, EncodedImage, Grid, Image, KeyAccelerator,
+    KeyAccelerators, KeyedView, LayoutControl, Line, PointerEventInfo, Stretch, ThemeBrush,
+    Thickness, View,
 };
 
 /// 포인터 위상 — elm과 무관한 WinUI 입력 단계.
@@ -49,25 +60,34 @@ pub enum PointerPhase {
 /// (elm `<Raw>`는 슬롯/props를 볼 수 없으므로 캡처가 유일한 통로다 — 예제 08).
 pub type PointerSink = Rc<dyn Fn(PointerPhase, f64, f64)>;
 
-/// 표면을 만든다 — `<Raw>`가 [`light_note_core::ui::surface_builder`]로 부른다.
-pub fn build(data: &SurfaceData, sink: &PointerSink, accelerators: KeyAccelerators) -> RawSlot {
-    let mut children: Vec<KeyedView> = Vec::with_capacity(data.lines.len() + 1);
+/// 디코드 완료 싱크 — 표면 빌더가 캡처해 `ImageOpened`를 호스트 메시지로 올린다.
+///
+/// **깜빡임 방지의 절반**이다: 호스트는 이 신호를 받은 뒤에만 레이어를 교체한다.
+pub type LayerSink = Rc<dyn Fn(usize)>;
 
-    if let Some(png) = data.png.as_ref() {
+/// 표면을 만든다 — `<Raw>`가 [`light_note_core::ui::surface_builder`]로 부른다.
+pub fn build(
+    data: &SurfaceData,
+    sink: &PointerSink,
+    decoded: &LayerSink,
+    accelerators: KeyAccelerators,
+) -> RawSlot {
+    let mut children: Vec<KeyedView> = Vec::with_capacity(StaticLayers::COUNT + data.ink.len());
+
+    // 정적 레이어 **두 장**은 항상 트리에 있다(마운트/언마운트로 깜빡이지 않는다).
+    for index in 0..StaticLayers::COUNT {
         children.push(KeyedView::new(
-            "static-layer",
-            Image::new()
-                .source_data(EncodedImage::new(png.clone()))
-                .stretch(Stretch::None)
-                .width(data.width as f64)
-                .height(data.height as f64)
-                .canvas_left(0.0)
-                .canvas_top(0.0),
+            format!("static-{index}"),
+            layer_view(data, index, decoded),
         ));
     }
 
-    for (index, line) in data.lines.iter().enumerate() {
-        children.push(KeyedView::new(format!("live-{index}"), line_view(line)));
+    // 라이브 레이어는 **획마다 한 그룹**이다(반투명 색의 그룹 불투명도 — [`stroke_view`]).
+    for (index, stroke) in data.ink.iter().enumerate() {
+        children.push(KeyedView::new(
+            format!("live-{index}"),
+            stroke_view(data, stroke),
+        ));
     }
 
     let canvas = Canvas::new()
@@ -108,9 +128,61 @@ pub fn build(data: &SurfaceData, sink: &PointerSink, accelerators: KeyAccelerato
     )
 }
 
+/// 숨은 레이어를 밀어 두는 창 밖 좌표 — 어떤 창 크기에서도 보이지 않는다
+/// (창은 자기 클라이언트 영역 밖을 그리지 않는다).
+const PARKED: f64 = -10_000.0;
+
+/// 정적 레이어 한 장 → WinUI `Image`.
+///
+/// **보이는 레이어만 종이 위(0,0)** 에 있고 나머지는 **창 밖으로 밀려 있다**. 크기를 0으로
+/// 줄이거나 클리핑에 기대지 않는다 — 숨은 레이어도 페이지 크기 그대로라 디코드와
+/// `ImageOpened`가 정상으로 오고, 화면에는 절대 드러나지 않는다.
+/// 디코드가 끝나면 `on_opened`가 호스트에 알리고, 호스트가 **그때** 앞뒤를 바꾼다.
+fn layer_view(data: &SurfaceData, index: usize, decoded: &LayerSink) -> Image {
+    let (left, top) = if data.is_visible(index) {
+        (0.0, 0.0)
+    } else {
+        (PARKED, PARKED)
+    };
+    let on_opened = Rc::clone(decoded);
+    Image::new()
+        // `Arc<[u8]>`를 그대로 넘긴다 — 어댑터의 `EncodedImage`는 `Arc` 동일성으로 비교하므로
+        // 그림이 그대로면 소스를 다시 설정하지 않는다(디코드도, 빈 프레임도, 복사도 없다).
+        .source_data(EncodedImage::new(data.png(index)))
+        .stretch(Stretch::None)
+        .width(data.width as f64)
+        .height(data.height as f64)
+        .canvas_left(left)
+        .canvas_top(top)
+        .on_opened(move || on_opened(index))
+}
+
+/// 라이브 획 하나 → WinUI 도형 묶음 = **한 합성 그룹**.
+///
+/// 자식 도형은 **불투명 색**으로 그리고 투명도는 그룹이 맡는다 — WinUI는 자식들을 먼저
+/// 합성한 뒤 투명도를 한 번만 적용하므로, 겹친 캡/관절이 두 번 곱해지지 않는다.
+/// 래스터가 한 획을 **한 번의 채움**으로 그리는 것과 같은 결과다(형광펜이 얼룩지지 않는다).
+fn stroke_view(data: &SurfaceData, stroke: &LiveStroke) -> View {
+    let rgb = stroke.opaque_color().to_rgb();
+    let mut children: Vec<KeyedView> = Vec::with_capacity(stroke.element_count());
+    for (index, line) in stroke.lines.iter().enumerate() {
+        children.push(KeyedView::new(format!("line-{index}"), line_view(line, rgb)));
+    }
+    for (index, cap) in stroke.caps.iter().enumerate() {
+        children.push(KeyedView::new(format!("cap-{index}"), cap_view(cap, rgb)));
+    }
+    Canvas::new()
+        .width(data.width as f64)
+        .height(data.height as f64)
+        .canvas_left(0.0)
+        .canvas_top(0.0)
+        .opacity(stroke.opacity())
+        .keyed_children(children)
+}
+
 /// 라이브 선분 하나 → WinUI `Line`.
-fn line_view(line: &SurfaceLine) -> Line {
-    let (red, green, blue) = line.color.to_rgb();
+fn line_view(line: &SurfaceLine, rgb: (u8, u8, u8)) -> Line {
+    let (red, green, blue) = rgb;
     Line::new()
         .x1(line.x1)
         .y1(line.y1)
@@ -118,6 +190,22 @@ fn line_view(line: &SurfaceLine) -> Line {
         .y2(line.y2)
         .stroke(Brush::from(Color::rgb(red, green, blue)))
         .stroke_thickness(line.width)
+}
+
+/// 둥근 캡(또는 점 하나) → WinUI `Ellipse`.
+///
+/// `windows-reactor` 0.100의 `Line`에는 캡 속성이 없다(`Stroke`/`StrokeThickness`/`X1..Y2`뿐).
+/// 그래서 래스터의 둥근 캡은 **채운 원**으로 그린다 — 래스터와 같은 반지름이라, 획을
+/// 확정하는 순간에도 잉크 끝이 자라지 않는다.
+fn cap_view(cap: &SurfaceCap, rgb: (u8, u8, u8)) -> Ellipse {
+    let (red, green, blue) = rgb;
+    let diameter = cap.radius * 2.0;
+    Ellipse::new()
+        .fill(Brush::from(Color::rgb(red, green, blue)))
+        .width(diameter)
+        .height(diameter)
+        .canvas_left(cap.x - cap.radius)
+        .canvas_top(cap.y - cap.radius)
 }
 
 /// Reactor 0.100이 지원하는 가속기 — 지원 키가 적어서 **확대/축소/페이지 추가**만 붙인다.

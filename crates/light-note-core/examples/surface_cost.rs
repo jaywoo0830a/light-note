@@ -4,8 +4,9 @@
 //! - **정적 레이어**(`InkSurface::build`/`static_layer`) — 획을 확정할 때 한 번. 페이지
 //!   전체를 CPU로 래스터화하고 PNG로 인코딩한다. **워커에서 도는 비용**이다(UI 스레드는
 //!   기다리지 않는다) — 그래도 얼마인지 알아야 "왜 백그라운드로 뺐는가"를 판단할 수 있다.
-//! - **라이브 선분**(`pending_lines`/`live_lines`) — 포인터가 움직일 때마다 **UI 스레드에서**.
-//!   진행 중인 획 하나 + 아직 PNG에 없는 꼬리.
+//! - **라이브 도형**(`pending_ink`/`live_ink`) — 포인터가 움직일 때마다 **UI 스레드에서**.
+//!   진행 중인 획 하나 + 아직 PNG에 없는 꼬리. 래스터와 **같은 기하**를 직선 조각으로 펴므로
+//!   획을 확정해도(라이브 → PNG 승격) 잉크 모양이 바뀌지 않는다.
 //!
 //! 실행: `cargo run --release -p light-note-core --example surface_cost`
 
@@ -15,7 +16,7 @@ use light_note_core::doc::Document;
 use light_note_core::geom::Size;
 use light_note_core::ink::{InkPoint, StrokeStyle, Tool};
 use light_note_core::raster::{self, ViewTransform};
-use light_note_core::surface::{live_lines, pending_lines, InkSurface};
+use light_note_core::surface::{live_ink, pending_ink, InkSurface};
 use light_note_core::ui::NoteViewModel;
 
 /// 한 번 실행하고 걸린 시간(ms)을 출력한다.
@@ -96,7 +97,7 @@ fn main() {
     }
     let live = in_progress.live_stroke().expect("진행 중인 획");
     println!("진행 중인 획: {}점", live.points().len());
-    time("live_lines — 600점", || live_lines(live, scale));
+    time("live_ink — 600점", || live_ink(live, scale));
 
     println!("\n── 획을 끝낸 직후 UI 스레드가 하는 일 ──");
     // 정적 레이어는 백그라운드로 갔으므로 UI 스레드에는 **꼬리 선분 몇 개**만 남는다.
@@ -105,8 +106,8 @@ fn main() {
     let strokes = committed.committed_strokes();
     let count = strokes.len();
     time(
-        "pending_lines — 방금 확정한 획 하나(꼬리)",
-        || pending_lines(&strokes[..count - 1], count - 1, None, scale),
+        "pending_ink — 방금 확정한 획 하나(꼬리)",
+        || pending_ink(&strokes[..count - 1], count - 1, None, scale),
     );
 
     println!("\n── 프레임마다 도는 부수 비용 ──");
@@ -119,7 +120,9 @@ fn main() {
     time("InkSurface clone(프레임마다 PNG 복사)", || {
         surface.clone()
     });
-    time("stage_surface용 PNG 복사", || surface.static_png.clone());
+    time("stage_surface용 레이어 복사(pngs)", || {
+        surface.layers.pngs()
+    });
     time("decode_static(PNG 디코드 — 참고)", || {
         surface.decode_static()
     });

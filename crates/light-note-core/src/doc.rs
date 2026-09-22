@@ -391,7 +391,7 @@ impl Document {
     /// **확정 스트로크만** — 진행 중인 획은 라이브 레이어가 그린다.
     ///
     /// 표면의 정적 레이어(PNG)가 이 목록을 그린다. 진행 중인 획까지 넣으면
-    /// 라이브 선분과 겹쳐 **두 번 그려진다**(형광펜에서 특히 티가 난다).
+    /// 라이브 도형과 겹쳐 **두 번 그려진다**(형광펜에서 특히 티가 난다).
     pub fn committed_strokes(&self) -> &[Stroke] {
         let strokes = self.active_page().strokes();
         if self.drawing.is_some() && !strokes.is_empty() {

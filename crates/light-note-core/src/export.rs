@@ -257,13 +257,23 @@ pub fn document_to_pdf(
             content.set_stroke_rgb(red, green, blue);
             content.set_fill_rgb(red, green, blue);
 
-            for (width_pt, path) in raster::stroke_paths(stroke, 1.0) {
-                emit_path(&mut content, &path, size.height);
-                if width_pt <= 0.0 {
-                    content.fill_nonzero(); // 점 하나 = 채운 원
-                } else {
-                    content.set_line_width(width_pt).stroke();
+            match raster::ink_shape(stroke, 1.0) {
+                Some(raster::InkShape::Curve { width, path }) => {
+                    emit_path(&mut content, &path, size.height);
+                    content.set_line_width(width).stroke();
                 }
+                Some(raster::InkShape::Spans { spans }) => {
+                    // 화면과 **같은 합집합**을 한 번에 채운다 — 관절에서 알파가 겹치지 않는다.
+                    emit_path(&mut content, &raster::spans_union(&spans), size.height);
+                    content.fill_nonzero();
+                }
+                Some(raster::InkShape::Dot { center, radius }) => {
+                    let mut dot = hayro::vello_cpu::kurbo::BezPath::new();
+                    raster::push_disc(&mut dot, center, radius);
+                    emit_path(&mut content, &dot, size.height);
+                    content.fill_nonzero(); // 점 하나 = 채운 원
+                }
+                None => {}
             }
         }
         content.restore_state();

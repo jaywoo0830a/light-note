@@ -69,7 +69,8 @@ fn empty_pages_render_to_nothing() {
     let pixmap = render_ink(&[], Size::A4, 1.0);
     assert_eq!(ink_coverage(&pixmap), 0);
     assert!(InkSurface::build(Size::A4, 1.0, &[], None)
-        .static_png
+        .layers
+        .visible_png()
         .is_none());
 }
 
@@ -233,8 +234,11 @@ fn document_pages_render_through_the_surface_contract() {
     let page = document.active_page();
     let surface = InkSurface::build(page.size(), 1.0, page.strokes(), document.live_stroke());
     assert_eq!((surface.width, surface.height), (200, 100));
-    assert!(surface.static_png.is_some(), "확정 레이어 PNG가 있어야 한다");
-    assert!(surface.lines.is_empty(), "드래그가 끝났으면 라이브 선분은 없다");
+    assert!(
+        surface.layers.visible_png().is_some(),
+        "확정 레이어 PNG가 있어야 한다"
+    );
+    assert!(surface.ink.is_empty(), "드래그가 끝났으면 라이브 도형은 없다");
 
     let decoded = surface.decode_static().expect("PNG 디코딩");
     assert!(pixel_at(&decoded, 100, 50).a > 200);

@@ -1,0 +1,5 @@
+# rustfmt 설정 — 이 저장소는 모든 텍스트 파일이 **CRLF**다(.editorconfig 참고).
+# `newline_style`을 지정하지 않으면 rustfmt가 파일을 **LF로 다시 써서** 인코딩 계약이 깨진다
+# (`encoding` 테스트가 잡아낸다 — 실제로 겪었다).
+edition = "2021"
+newline_style = "Windows"

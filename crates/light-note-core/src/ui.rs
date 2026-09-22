@@ -10,9 +10,11 @@
 //! 문서·도구·페이지는 **호스트가 소유**하고 props로 내려온다(예제 11·20의 패턴).
 //! 화면은 그것을 그리고, 의도(intent)를 콜백 prop으로 올려보낸다.
 
+use std::sync::Arc;
+
 use crate::doc::Document;
 use crate::ink::{StrokeStyle, Tool};
-use crate::surface::{InkSurface, SurfaceLine};
+use crate::surface::{blank_png, InkSurface, LiveStroke, StaticLayers};
 use elm_magic::Callback;
 
 /// `<Raw>`가 값을 채우는 슬롯.
@@ -29,15 +31,47 @@ pub type SurfaceSlot = Option<()>;
 /// 표면을 그리는 데 필요한 재료 — `<Raw>` 클로저가 호스트에 넘긴다.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SurfaceData {
-    /// 확정 스트로크를 그린 PNG(투명 배경). 스트로크가 없으면 `None`.
-    pub png: Option<Vec<u8>>,
-    /// 진행 중인 획의 선분들.
-    pub lines: Vec<SurfaceLine>,
+    /// 정적 레이어 **두 장**(더블 버퍼). 보이지 않는 레이어에 새 PNG가 스테이징된다.
+    pub layers: [Option<Arc<[u8]>>; StaticLayers::COUNT],
+    /// 지금 보이는 레이어 인덱스 — 빌더는 **이 레이어만** 페이지 크기로 그린다.
+    pub front: usize,
+    /// 진행 중인 획 + 아직 PNG에 없는 꼬리 — **획마다 한 합성 그룹**([`LiveStroke`]).
+    pub ink: Vec<LiveStroke>,
     /// 표면 크기(DIP).
     pub width: u16,
     pub height: u16,
     /// 1pt당 픽셀 수.
     pub scale: f32,
+}
+
+impl SurfaceData {
+    /// 호스트의 표면 재료에서 만든다 — 발행 직전에 [`stage_surface`]로 넘긴다.
+    pub fn from_surface(surface: &InkSurface) -> Self {
+        Self {
+            layers: surface.layers.pngs(),
+            front: surface.layers.front(),
+            ink: surface.ink.clone(),
+            width: surface.width,
+            height: surface.height,
+            scale: surface.scale,
+        }
+    }
+
+    /// 이 레이어가 화면에 보이는가(빌더가 크기를 정할 때 쓴다).
+    pub fn is_visible(&self, index: usize) -> bool {
+        index == self.front
+    }
+
+    /// 레이어 `index`의 PNG — **빈 레이어도 그림이 있다**(1×1 투명 PNG).
+    ///
+    /// 어댑터의 `Image::source_data`에는 소스를 비우는 API가 없어서(`Property::Inherited`는
+    /// "그대로 두기"), "빈 레이어"는 소스 없음이 아니라 빈 그림으로 표현한다([`blank_png`]).
+    pub fn png(&self, index: usize) -> Arc<[u8]> {
+        self.layers
+            .get(index)
+            .and_then(|png| png.clone())
+            .unwrap_or_else(blank_png)
+    }
 }
 
 /// 호스트가 등록하는 표면 빌더 — `SurfaceData`를 WinUI 컨트롤 트리로 바꾼다.
@@ -256,7 +290,7 @@ elm_magic::view! {
                         <Button on_click={on_zoom_out()}>"축소"</Button>
                         "확대 {zoom:.0}%"
                         <Button on_click={on_zoom_in()}>"확대"</Button>
-                        "선분 {surface_lines}개"
+                        "도형 {surface_lines}개"
                     </Row>
                     // 상태는 enum 하나로 두고 <Switch>로 빠짐없이 분기한다(예제 19).
                     // "빈 페이지"와 "여는 중"과 "실패"는 다른 화면이다.
@@ -367,7 +401,7 @@ impl Default for NoteViewModel {
 }
 
 impl NoteViewModel {
-    /// 문서에서 화면 값을 만든다(표면 크기/선분 수는 [`Self::with_surface`]로).
+    /// 문서에서 화면 값을 만든다(표면 크기/도형 수는 [`Self::with_surface`]로).
     pub fn from_document(document: &Document, tool: Tool, width_pt: f32, zoom: f32) -> Self {
         Self {
             tool,
@@ -411,7 +445,7 @@ impl NoteViewModel {
     pub fn with_surface(mut self, surface: &InkSurface) -> Self {
         self.surface_width = surface.width;
         self.surface_height = surface.height;
-        self.surface_lines = surface.line_count();
+        self.surface_lines = surface.element_count();
         self
     }
 

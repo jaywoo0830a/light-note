@@ -16,13 +16,18 @@
 //! - `HostMessage`는 `Send`다(`spawn_background` 요구 — 예제 11). 그래서 **PDF 문서를
 //!   메시지에 넣지 않는다**(`PdfDocument`는 스레드 경계를 넘기지 않는다).
 //! - 백그라운드: 파일 읽기/쓰기/내보내기, **정적 레이어 래스터 + PNG 인코딩**.
-//!   UI 스레드: elm 프레임과 라이브 선분(선분 몇 개). 페이지 전체를 다시 그리는 일은
+//!   UI 스레드: elm 프레임과 라이브 도형(도형 몇 개). 페이지 전체를 다시 그리는 일은
 //!   포인터 메시지 안에서 하지 않는다 — 실측 A4 한 장 = 13ms(release)/277ms(dev).
-//!   그 사이에 확정된 획은 라이브 선분으로 계속 그린다([`pending_lines`]).
+//!   그 사이에 확정된 획은 라이브 도형으로 계속 그린다([`pending_ink`]).
+//! - **플리커 금지(구조적)**: 정적 레이어는 두 장이고([`StaticLayers`]), 새 그림은
+//!   보이지 않는 뒤 레이어에 올라간 뒤 **디코드 완료 신호**(`ImageOpened` →
+//!   [`HostMessage::LayerReady`])를 받고서야 앞뒤가 바뀐다. 어댑터가 소스를 비우고
+//!   비동기로 디코드하는 사이 빈 프레임이 화면에 노출될 수 있는 경로가 없다.
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use elm_magic_windows_reactor::{ElmInput, ElmView};
 use light_note_core::doc::Document;
@@ -32,14 +37,21 @@ use light_note_core::history::Edit;
 use light_note_core::ink::{pressure_from_speed, InkPoint, Stroke, StrokeStyle, Tool};
 use light_note_core::pdf::PdfDocument;
 use light_note_core::raster::{page_pixel_size, ViewTransform};
-use light_note_core::surface::{has_ink, pending_lines, static_layer, InkSurface};
+use light_note_core::surface::{has_ink, pending_ink, static_layer, InkSurface};
 use light_note_core::ui::{
     self, NoteApp, NoteAppProps, NoteIntents, NoteViewModel, Phase, SurfaceData,
 };
 use windows_reactor::{Component, ComponentContext, View, ViewContext};
 
 use crate::files;
-use crate::surface::{self, PointerPhase, PointerSink};
+use crate::surface::{self, LayerSink, PointerPhase, PointerSink};
+
+/// 디코드 완료 신호를 기다리는 시간 — 신호가 끝내 오지 않으면 이만큼 뒤에 승격한다(안전망).
+const LAYER_SETTLE: Duration = Duration::from_millis(150);
+
+/// 승격을 허용하는 최소 경과 — 이보다 최근에 스테이징됐다면 아직 디코드 중일 수 있다
+/// (성급히 승격하면 갓 비워진 소스가 화면에 드러난다 = 깜빡임).
+const LAYER_SETTLE_GRACE: Duration = Duration::from_millis(120);
 
 /// 호스트 메시지 — `spawn_background`가 돌려주므로 **`Send`**여야 한다.
 #[derive(Clone, Debug)]
@@ -53,8 +65,12 @@ pub enum HostMessage {
     StaticLayer {
         generation: u64,
         count: usize,
-        png: Option<Vec<u8>>,
+        png: Option<Arc<[u8]>>,
     },
+    /// 뒤 레이어의 **디코드가 끝났다**(`ImageOpened`) — 이제 앞뒤를 바꿔도 안전하다.
+    LayerReady(usize),
+    /// 안전망: 디코드 신호 없이 충분히 기다렸다 — 승격해도 안전하다.
+    LayerSettled,
     /// 백그라운드에서 읽은 PDF 파일.
     Opened(Result<files::OpenedFile, String>),
     /// 백그라운드 내보내기 결과(저장된 경로).
@@ -72,18 +88,13 @@ pub struct Shell {
     width_pt: f32,
     zoom: f32,
     phase: Phase,
-    /// 표면 재료(정적 PNG + 라이브 선분). 발행 직전에 `<Raw>`로 넘긴다.
+    /// 표면 재료(정적 PNG + 라이브 도형). 발행 직전에 `<Raw>`로 넘긴다.
     surface: InkSurface,
     /// 정적 레이어를 다시 만들어야 하는가(획 커밋/되돌리기/페이지 이동/줌).
     ///
     /// 이 플래그가 서 있으면 표면을 갱신하는 김에 **백그라운드**에 맡긴다
     /// ([`Shell::request_static`]) — UI 스레드는 래스터/인코딩을 기다리지 않는다.
     surface_dirty: bool,
-    /// 화면에 있는 정적 PNG가 반영한 확정 스트로크 수.
-    ///
-    /// 그 뒤에 확정된 획은 PNG에 없으므로 라이브 레이어가 계속 그린다
-    /// ([`pending_lines`]) — 렌더가 끝나기 전에 그은 획도 화면에 남는다.
-    static_snapshot: usize,
     /// 진행 중인 정적 렌더의 세대(없으면 `None`) — 한 번에 하나만 돌린다.
     static_inflight: Option<u64>,
     /// 세대 카운터 — 낡은 렌더 결과를 버리는 기준(되돌리기/지우개/페이지 이동/줌).
@@ -116,7 +127,7 @@ impl Shell {
     ///
     /// 이 구분이 "획을 끝내도 화면이 멈추지 않는다"의 근거다:
     /// - 정적 레이어(A4 = 13ms release / 277ms dev)는 워커가 만들고 결과를 메시지로 받는다.
-    /// - 라이브 레이어는 선분 몇 개만 갈아 끼운다(600점 = 0.1ms).
+    /// - 라이브 레이어는 도형 몇 개만 갈아 끼운다(600점 = 0.1ms).
     /// - PNG가 도착하기 전에 확정된 획은 꼬리로 남아 라이브 레이어가 그린다.
     fn refresh_surface(&mut self, context: &ComponentContext<Self>) {
         let size = self.document.active_page().size();
@@ -130,8 +141,10 @@ impl Shell {
             self.surface.width = width;
             self.surface.height = height;
             self.surface.scale = scale;
-            // 크기/배율이 바뀌면 화면의 PNG는 **다른 그림**이다 — 지우고 새로 만든다.
-            self.clear_static();
+            // 크기/배율이 바뀌었다 — 화면의 PNG는 새 크기로 그려야 한다. **지우지는 않는다**:
+            // 새 그림이 디코드될 때까지 옛 그림이 그대로 보이는 편이 빈 페이지가 번쩍이는
+            // 것보다 낫다(플리커 없음). 새 그림은 승격될 때 이 크기로 나타난다.
+            self.mark_static_dirty();
         }
 
         if self.surface_dirty && self.static_inflight.is_none() {
@@ -139,9 +152,12 @@ impl Shell {
             self.request_static(context, size);
         }
 
-        self.surface.lines = pending_lines(
+        // 꼬리의 기준은 **화면에 보이는 레이어**가 반영한 획 수다 — 아직 승격되지 않은
+        // 획은 라이브 도형으로 계속 그린다(그래서 PNG가 도착하기 전에도 잉크가 보인다).
+        // 라이브 도형은 래스터와 **같은 기하**라, 승격 순간에도 잉크 모양이 바뀌지 않는다.
+        self.surface.ink = pending_ink(
             self.document.committed_strokes(),
-            self.static_snapshot,
+            self.surface.layers.visible_count(),
             self.document.live_stroke(),
             scale,
         );
@@ -155,9 +171,8 @@ impl Shell {
     fn request_static(&mut self, context: &ComponentContext<Self>, size: Size) {
         let committed = self.document.committed_strokes();
         if !has_ink(committed) {
-            // 그릴 잉크가 없다 — 워커도 PNG도 필요 없다(빈 페이지).
-            self.surface.static_png = None;
-            self.static_snapshot = committed.len();
+            // 그릴 잉크가 없다 — 래스터도 워커도 필요 없다(빈 레이어를 바로 스테이징).
+            self.stage_static(context, None, committed.len());
             return;
         }
 
@@ -176,32 +191,67 @@ impl Shell {
     }
 
     /// 백그라운드가 만든 PNG를 받는다 — **최신 세대만** 받는다.
-    fn adopt_static(&mut self, generation: u64, count: usize, png: Option<Vec<u8>>) {
+    ///
+    /// 새 그림은 **보이지 않는 뒤 레이어**에 올라간다. 화면은 그대로다 — 뒤 레이어의
+    /// 디코드가 끝나 `ImageOpened`가 오면 [`Shell::layer_decoded`]가 앞뒤를 바꾼다.
+    /// 그 사이 방금 확정한 획은 라이브 도형(꼬리)이 그리고 있으므로 **빈 틈도, 깜빡임도 없다**.
+    fn adopt_static(
+        &mut self,
+        context: &ComponentContext<Self>,
+        generation: u64,
+        count: usize,
+        png: Option<Arc<[u8]>>,
+    ) {
         if self.static_inflight != Some(generation) {
             return; // 그 사이 되돌리기/지우개/페이지 이동이 있었다 — 낡은 그림이다
         }
         self.static_inflight = None;
-        self.surface.static_png = png;
-        // 이 PNG가 반영한 확정 스트로크 수 — 렌더 중에 더 그은 획은 라이브로 남는다.
-        self.static_snapshot = count.min(self.document.committed_strokes().len());
+        self.stage_static(
+            context,
+            png,
+            count.min(self.document.committed_strokes().len()),
+        );
     }
 
-    /// 정적 레이어가 **낡았다**고 표시한다(같은 페이지/배율, 내용만 바뀐 경우).
+    /// 그림을 뒤 레이어에 올린다 — 이미 같은 그림이 디코드돼 있으면 기다리지 않고 바꾼다.
     ///
-    /// 화면의 PNG는 그대로 둔다(되돌리기 직후 옛 잉크가 한 프레임 남는 편이 빈 페이지가
-    /// 번쩍이는 것보다 낫다). 진행 중이던 렌더 결과는 버린다 — 세대를 올려 도착해도
-    /// 반영되지 않게 한다(되돌린 스트로크가 되살아나지 않는다).
+    /// 아니면 **디코드 완료 신호를 기다린다**(`ImageOpened` → [`HostMessage::LayerReady`]).
+    /// 그 신호가 끝내 오지 않는 경우(창 밖 요소를 WinUI가 게으르게 다룰 때)를 대비해
+    /// 안전망도 함께 건다 — 잠깐 기다렸다가, 그 사이 새 스테이징이 없었으면 승격한다.
+    /// 어느 쪽이든 기다리는 동안 화면은 옛 레이어 + 라이브 꼬리라 **비지 않는다**.
+    fn stage_static(
+        &mut self,
+        context: &ComponentContext<Self>,
+        png: Option<Arc<[u8]>>,
+        count: usize,
+    ) {
+        if self.surface.layers.stage(png, count) {
+            self.surface.layers.promote_staged();
+            return;
+        }
+        let _ = context.spawn_background(move |_cancel| {
+            std::thread::sleep(LAYER_SETTLE);
+            HostMessage::LayerSettled
+        });
+    }
+
+    /// 뒤 레이어의 디코드가 끝났다(`ImageOpened`) → 앞뒤를 바꾼다.
+    ///
+    /// **이 신호가 있어야만 화면이 바뀐다** — 소스가 갓 바뀐(그래서 잠시 비어 있는)
+    /// 레이어가 화면에 노출되는 일이 구조적으로 없다.
+    fn layer_decoded(&mut self, index: usize) {
+        self.surface.layers.promote(index);
+    }
+
+    /// 정적 레이어가 **낡았다**고 표시한다(내용/페이지/배율이 바뀌었다).
+    ///
+    /// 화면의 레이어는 **그대로 둔다**: 새 그림이 디코드되어 승격될 때까지 옛 그림이
+    /// 보인다(빈 페이지가 번쩍이는 것보다 낫다 — 플리커 금지). 진행 중이던 렌더 결과는
+    /// 세대를 올려 버린다(되돌린 스트로크가 되살아나지 않는다).
     fn mark_static_dirty(&mut self) {
         self.surface_dirty = true;
-        self.static_snapshot = self.document.committed_strokes().len();
         self.static_generation += 1;
         self.static_inflight = None;
-    }
-
-    /// 화면의 PNG를 버린다 — 페이지/배율이 바뀌어 다른 그림이 됐을 때.
-    fn clear_static(&mut self) {
-        self.surface.static_png = None;
-        self.mark_static_dirty();
     }
 
     /// 포인터 한 점 — 모델에 반영한다.
@@ -255,9 +305,9 @@ impl Shell {
             PointerPhase::Canceled if self.drawing => {
                 self.drawing = false;
                 self.document.cancel();
-                // 취소는 드래그 **직전 상태**로 되돌린다 — 화면의 PNG가 이미 그 상태면
+                // 취소는 드래그 **직전 상태**로 되돌린다 — 화면의 레이어가 이미 그 상태면
                 // 다시 그릴 필요가 없다(포인터 캡처 유실에서 화면이 멈추지 않는다).
-                if self.document.committed_strokes().len() != self.static_snapshot {
+                if self.document.committed_strokes().len() != self.surface.layers.visible_count() {
                     self.mark_static_dirty();
                 }
                 self.status = "획을 취소했습니다".to_string();
@@ -312,7 +362,7 @@ impl Shell {
                 let size = self.document.active_page().size();
                 self.document.add_page_after_active(size);
                 self.status = self.document.status_line();
-                self.clear_static();
+                self.mark_static_dirty();
             }
             "page_remove" => {
                 let index = self.document.active_index();
@@ -321,17 +371,17 @@ impl Shell {
                 } else {
                     "마지막 페이지는 지울 수 없습니다".to_string()
                 };
-                self.clear_static();
+                self.mark_static_dirty();
             }
             "page_prev" => {
                 if self.document.step_page(-1) {
-                    self.clear_static();
+                    self.mark_static_dirty();
                     self.status = self.document.status_line();
                 }
             }
             "page_next" => {
                 if self.document.step_page(1) {
-                    self.clear_static();
+                    self.mark_static_dirty();
                     self.status = self.document.status_line();
                 }
             }
@@ -438,7 +488,8 @@ impl Shell {
                 self.phase = Phase::Failed(error.to_string());
             }
         }
-        self.clear_static();
+        // 새 문서다 — 화면의 레이어는 새 그림이 승격될 때 바뀐다(깜빡이지 않는다).
+        self.mark_static_dirty();
     }
 }
 
@@ -457,7 +508,6 @@ impl Component for Shell {
             phase: Phase::Empty,
             surface: InkSurface::build(Size::A4, ViewTransform::DEFAULT_SCALE, &[], None),
             surface_dirty: true,
-            static_snapshot: 0,
             static_inflight: None,
             static_generation: 0,
             drawing: false,
@@ -476,7 +526,12 @@ impl Component for Shell {
                 generation,
                 count,
                 png,
-            } => self.adopt_static(generation, count, png),
+            } => self.adopt_static(context, generation, count, png),
+            HostMessage::LayerReady(index) => self.layer_decoded(index),
+            HostMessage::LayerSettled => {
+                // 안전망 — 충분히 기다렸고 그 사이 새 스테이징이 없었을 때만 바꾼다.
+                self.surface.layers.promote_if_settled(LAYER_SETTLE_GRACE);
+            }
             HostMessage::Opened(Ok(file)) => self.adopt_pdf(file),
             HostMessage::Opened(Err(error)) => {
                 self.status = error.clone();
@@ -505,25 +560,25 @@ impl Component for Shell {
             let _ = pointer_sender.send(HostMessage::Pointer(phase, x, y));
         });
 
-        // ② 가속기(Reactor가 지원하는 키만) → 같은 큐.
+        // ② 디코드 완료 → 레이어 교체. **이 신호 뒤에만** 화면이 바뀐다(빈 프레임 없음).
+        let layer_sender = sender.clone();
+        let layers: LayerSink = Rc::new(move |index| {
+            let _ = layer_sender.send(HostMessage::LayerReady(index));
+        });
+
+        // ③ 가속기(Reactor가 지원하는 키만) → 같은 큐.
         let accelerator_sender = sender.clone();
         let accelerators = surface::default_accelerators(move |intent| {
             let _ = accelerator_sender.send(HostMessage::Intent(intent));
         });
         ui::set_surface_builder(Rc::new(move |data: &SurfaceData| {
-            surface::build(data, &sink, accelerators.clone())
+            surface::build(data, &sink, &layers, accelerators.clone())
         }));
 
-        // ③ 발행 직전에 표면 재료를 넣는다 — `<Raw>`가 꺼내 간다(슬롯을 못 보므로).
-        ui::stage_surface(SurfaceData {
-            png: self.surface.static_png.clone(),
-            lines: self.surface.lines.clone(),
-            width: self.surface.width,
-            height: self.surface.height,
-            scale: self.surface.scale,
-        });
+        // ④ 발행 직전에 표면 재료를 넣는다 — `<Raw>`가 꺼내 간다(슬롯을 못 보므로).
+        ui::stage_surface(SurfaceData::from_surface(&self.surface));
 
-        // ④ 호스트 → elm: props / elm → 호스트: 콜백 prop (예제 11).
+        // ⑤ 호스트 → elm: props / elm → 호스트: 콜백 prop (예제 11).
         let view_model =
             NoteViewModel::from_document(&self.document, self.tool, self.width_pt, self.zoom)
                 .with_pdf(self.pdf_name().as_deref())
