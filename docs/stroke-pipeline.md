@@ -93,9 +93,9 @@ fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
 조각도 같은 방식이다 — 화면은 **무엇이 필요한가**만 말한다:
 
 ```rust
-pub fn Header() {                       // ui.rs (앱바)
+pub fn TitleBar() {                     // ui.rs (네이티브 타이틀바)
     <Raw>|out: &mut SurfaceSlot| {
-        *out = part(Part::Header);       // 값·빌더·통로가 있으면 parts::header::header(view)
+        *out = part(Part::TitleBar);     // 값·빌더·통로가 있으면 parts::titlebar::titlebar(view)
     }</Raw>
 }
 ```

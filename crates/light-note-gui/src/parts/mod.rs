@@ -139,7 +139,7 @@ pub(crate) fn content_height(view: &ViewModel) -> f64 {
     (view.viewport.1 - TOKENS.chrome_h).max(TOKENS.content_min)
 }
 
-/// **위쪽 1px 선** — 앱바·툴바·상태바를 본문과 나눈다(예제 28의 머리글/바닥글).
+/// **위쪽 1px 선** — 툴바·상태 띠를 본문과 나눈다(예제 28의 머리글/바닥글).
 pub(crate) fn hairline() -> View {
     Border::new()
         .border_brush(stroke_brush())
@@ -211,11 +211,12 @@ pub(crate) fn chip_accent(text: impl Into<String>) -> View {
 /// 둘 다 이 리액터 버전에서 폭을 못 받는다: `Grid`에 `columns()`를 주면 첫 열이 남은 폭을
 /// 다 먹어(무한 폭으로 측정된다) 둘째 열이 화면 밖으로 나가고, 열 없이 한 셀에 겹쳐 놓고
 /// `HorizontalAlignment::Right`를 주면 셀이 0폭이라 자식이 **왼쪽 바깥**으로 밀린다
-/// (실제로 겪었다 — 앱바의 배지와 툴바의 미리보기가 통째로 안 보였다).
+/// (실제로 겪었다 — 배지 묶음과 잉크 미리보기가 통째로 안 보였다).
 ///
-/// 그래서 배치는 **줄을 나누는 것**으로만 한다: 앱바는 (제목 줄 / 배지 줄),
-/// 툴바는 (버튼 줄 / 미리보기 줄), 상태바는 (문장 줄 / 힌트·사실 줄) — 전부 왼쪽에서
-/// 시작하는 흐름이라 폭과 무관하게 안전하다.
+/// 그래서 배치는 **줄을 나누는 것**으로만 한다: 툴바는 (버튼 줄 / 미리보기 줄, 좁으면 버튼이
+/// 다시 둘), 상태 띠는 (문장 줄 / 사실 줄) — 전부 왼쪽에서 시작하는 흐름이라 폭과 무관하게
+/// 안전하다. **타이틀바만 예외**다: 네이티브 `TitleBar`의 슬롯(`Content`/`RightHeader`)이
+/// 자리를 정해 주므로 거기서는 양 끝 배치가 성립한다(`parts::titlebar`).
 pub(crate) fn row(spacing: f64, children: Vec<View>) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)

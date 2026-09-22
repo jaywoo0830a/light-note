@@ -22,7 +22,7 @@ use light_note_gui::ui::{
     SurfaceSlot, TitleBar, TitleBarProps, ViewModel,
 };
 
-/// 화면이 **항상** 갖는 조각 수 — 앱바 · 툴바 · 레일 · 상태바.
+/// 화면이 **항상** 갖는 조각 수 — 타이틀바 · 툴바 · 레일 · 상태 띠.
 const CHROME_RAW: usize = 4;
 
 /// 화면에 내려가는 값 하나 — 호스트가 진실을 소유하므로 테스트가 그 값을 정한다.
@@ -169,7 +169,7 @@ fn every_visible_string_is_english_only() {
 
 #[test]
 fn the_screen_is_chrome_plus_ink() {
-    // 조각의 **순서**가 곧 화면 순서다: 앱바 → 툴바 → 정보 띠 → 본문(레일 + 잉크).
+    // 조각의 **순서**가 곧 화면 순서다: 타이틀바 → 툴바 → 정보 띠 → 본문(레일 + 잉크).
     // 정보 띠가 본문 **위**에 있는 것은 의도다: 아래에 두면 잉크 영역 높이 추정이 틀릴 때
     // 화면 밖으로 밀린다.
     let (node, _) = plan_of(view(Tool::Pen, Stage::Ready));
@@ -177,7 +177,7 @@ fn the_screen_is_chrome_plus_ink() {
     assert_eq!(
         kinds,
         vec!["Raw", "Raw", "Raw", "StackPanel"],
-        "앱바 · 툴바 · 정보 띠(조각) · 본문(레일 조각 + 잉크 조각)"
+        "타이틀바 · 툴바 · 정보 띠(조각) · 본문(레일 조각 + 잉크 조각)"
     );
 }
 
@@ -341,7 +341,7 @@ fn the_surface_reaches_the_registered_builder_through_one_raw_slot() {
     // 표면은 값도 받는다(잉크 영역 높이·빈 상태 안내) — 호스트의 `stage_view`와 같다.
     stage_view(view(Tool::Pen, Stage::Ready));
 
-    // 잉크 표면만 계획한다 — 조각(앱바/툴바/…)과 섞이지 않게 **컴포넌트 하나**로 본다.
+    // 잉크 표면만 계획한다 — 조각(타이틀바/툴바/…)과 섞이지 않게 **컴포넌트 하나**로 본다.
     let mut ctx = Ctx::new();
     let tree = elm_magic::frame::<InkSurface>(&mut ctx, &InkSurfaceProps::default());
     let (_, pass) = plan(&tree);
