@@ -143,10 +143,32 @@ impl CanvasTool {
     /// `pressure`가 `Some`이면 그것이 이 획의 시작 굵기다: 필압은 **장치가 아는 사실**이고
     /// 속도 추정은 대체값이기 때문이다.
     pub fn press_with(&mut self, doc: &mut Doc, at: Pt, now: Instant, pressure: Option<f32>) {
+        self.press_as(doc, at, now, pressure, false);
+    }
+
+    /// 손을 댔다 — **뒤집힌 펜**(`PEN_FLAG_INVERTED`)이면 **이 제스처는 지운다**.
+    ///
+    /// 도구 선택은 건드리지 않는다: 뒤집기를 풀면 사용자가 고른 도구가 그대로여야 한다.
+    /// 그래서 "지우개로 바꾼다"가 아니라 "이 제스처만 지운다"다 — 펜을 뒤집는 순간은
+    /// 도구를 고르는 순간이 아니라 **손의 자세**가 바뀌는 순간이기 때문이다.
+    pub fn press_inverted(&mut self, doc: &mut Doc, at: Pt, now: Instant, pressure: Option<f32>) {
+        self.press_as(doc, at, now, pressure, true);
+    }
+
+    /// 제스처의 시작 — 뒤집힘은 **이 제스처에만** 적용된다([`Gesture`]가 성격을 들고 간다).
+    fn press_as(
+        &mut self,
+        doc: &mut Doc,
+        at: Pt,
+        now: Instant,
+        pressure: Option<f32>,
+        inverted: bool,
+    ) {
         self.cancel(doc);
         self.last = Some((at, now));
         let page = doc.active_index();
-        if self.state.tool.is_eraser() {
+        // 뒤집힌 펜은 지우개다 — 지우개 도구일 때와 **같은 길**로 간다(지우는 규칙은 하나다).
+        if inverted || self.state.tool.is_eraser() {
             let removed = doc
                 .page_mut(page)
                 .map(|page| page.erase_at(at, self.state.eraser_radius_pt))

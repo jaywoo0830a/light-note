@@ -51,6 +51,27 @@ fn working() -> Digest {
 }
 
 #[test]
+fn the_frame_line_reports_the_pen_pose() {
+    // `penFlags`/`PEN_MASK_ROTATION`도 **사실**이다 — 진단이 뒤집힘·지우개 끝·회전을 말하는가.
+    let digest = Digest {
+        last: Some(
+            PointerFrame::new(Device::Pen, Some(0.4), None, std::time::Instant::now())
+                .with_pen_pose(true, true, Some(90.0)),
+        ),
+        ..working()
+    };
+    let frame = row(&digest, "Last frame");
+    assert!(frame.contains("flipped (erasing)"), "{frame}");
+    assert!(frame.contains("eraser tip"), "{frame}");
+    assert!(frame.contains("rotation 90"), "{frame}");
+
+    // 보고하지 않은 자세는 **말하지 않는다**(없는 값을 0으로 채우지 않는다).
+    let plain = row(&working(), "Last frame");
+    assert!(!plain.contains("flipped"), "{plain}");
+    assert!(!plain.contains("rotation"), "{plain}");
+}
+
+#[test]
 fn a_working_digitizer_reports_every_gate_as_open() {
     let digest = working();
     assert!(row(&digest, "System digitizer").contains("integrated pen"));

@@ -302,13 +302,24 @@ impl Shell {
 
         match sample.phase {
             Phase::Pressed => {
-                self.tool.press_with(
-                    self.canvas.doc_mut(),
-                    sample.at,
-                    sample.now,
-                    sample.pressure(),
-                );
-                self.status = Self::pen_status(sample);
+                // **뒤집힌 펜은 지운다**(`PEN_FLAG_INVERTED`) — 도구 선택은 그대로 둔다.
+                if sample.inverted() {
+                    self.tool.press_inverted(
+                        self.canvas.doc_mut(),
+                        sample.at,
+                        sample.now,
+                        sample.pressure(),
+                    );
+                    self.status = "Erasing — the pen is flipped".to_string();
+                } else {
+                    self.tool.press_with(
+                        self.canvas.doc_mut(),
+                        sample.at,
+                        sample.now,
+                        sample.pressure(),
+                    );
+                    self.status = Self::pen_status(sample);
+                }
             }
             Phase::Moved => {
                 if self.tool.is_active() {

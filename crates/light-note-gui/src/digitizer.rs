@@ -25,7 +25,22 @@
 //! 마우스다([`crate::input::Sample::device`]). ②가 그 장치를 보고 **펜만** 잉크로 만든다
 //! ([`crate::tool::CanvasTool::accepts`]).
 //!
+//! ## `POINTER_PEN_INFO`를 어디까지 쓰는가 (공식 계약)
+//! | 필드 | 쓰는가 |
+//! |---|---|
+//! | `pressure`(0~1024) | ✅ `PEN_MASK_PRESSURE`일 때만 → 0.0~1.0([`crate::input::pressure_from_raw`]) |
+//! | `tiltX`/`tiltY`(−90~+90) | ✅ 두 축이 **둘 다** 보고됐을 때만 `Some` |
+//! | `penFlags` | ✅ `PEN_FLAG_INVERTED`(뒤집힘 → **지운다**) · `PEN_FLAG_ERASER`(지우개 끝의 유무) |
+//! | `rotation`(0~359) | ⚠️ `PEN_MASK_ROTATION`일 때만 읽어 **진단에만** 보여준다(잉크 모양에는 안 쓴다) |
+//! | `pointerInfo.pointerFlags` | ✅ `POINTER_FLAG_INCONTACT` — 호버 갱신은 **프레임이 아니다** |
+//! | `pointerInfo.historyCount` | ❌ 안 쓴다 — 아래 한계 참고 |
+//!
 //! ## 한계 (정직하게)
+//! - **점이 뭉쳐 오면 최신 하나만** 쓴다: 문서는 "처리가 못 따라가면 메시지가 합쳐지니
+//!   `GetPointerPenInfoHistory`를 쓰라"고 말한다. 지금은 합쳐진 갱신에서 **마지막 점**만 취하므로
+//!   아주 빠른 획에서 점 간격이 넓어진다 — 고치려면 히스토리를 **여러 표본**으로 흘려야 하고,
+//!   그러면 "이벤트 하나 = 표본 하나"인 ①의 계약이 바뀐다(다음 단계).
+//! - **`PEN_FLAG_BARREL`(배럴 버튼)은 안 쓴다** — 보조 버튼에 동작을 붙이지 않았다.
 //! - **UI 스레드 전용**이다: 프레임은 스레드 로컬이고 잠금이 없다(읽는 쪽도 UI 스레드다).
 //! - **시간 결합**: WinUI 이벤트는 `WM_POINTER` 메시지 **직후** 같은 스레드에서 온다. 그래서
 //!   "이벤트 순간의 최신 프레임"이 그 이벤트의 프레임이다. 낡은 프레임은 ①이 버린다.
@@ -301,6 +316,16 @@ impl Digest {
         if let Some((x, y)) = frame.tilt {
             text.push_str(&format!(" · tilt {x:.0}/{y:.0}"));
         }
+        // 펜의 **자세**도 사실이다: 뒤집힘(지우개 끝) · 지우개 끝의 유무 · 회전.
+        if frame.inverted {
+            text.push_str(" · flipped (erasing)");
+        }
+        if frame.has_eraser {
+            text.push_str(" · eraser tip");
+        }
+        if let Some(rotation) = frame.rotation {
+            text.push_str(&format!(" · rotation {rotation:.0}"));
+        }
         if let Some(age) = self.last_age_ms {
             text.push_str(&format!(" · {age} ms ago"));
         }
@@ -384,14 +409,17 @@ mod win32 {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::Pointer::{GetPointerPenInfo, GetPointerType, POINTER_PEN_INFO};
+    use windows::Win32::UI::Input::Pointer::{
+        GetPointerInfo, GetPointerPenInfo, GetPointerType, POINTER_FLAG_INCONTACT, POINTER_INFO,
+        POINTER_PEN_INFO,
+    };
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, EnumThreadWindows, GetClassNameW, GetClientRect, GetSystemMetrics,
         GetWindowTextW, IsWindowVisible, NID_EXTERNAL_PEN, NID_INTEGRATED_PEN,
-        NID_INTEGRATED_TOUCH, NID_READY, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
-        POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, SM_DIGITIZER, WM_POINTERDOWN, WM_POINTERUP,
-        WM_POINTERUPDATE,
+        NID_INTEGRATED_TOUCH, NID_READY, PEN_FLAG_ERASER, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE,
+        PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH,
+        SM_DIGITIZER, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
     };
 
     use super::{
@@ -561,9 +589,26 @@ mod win32 {
     ) -> LRESULT {
         if matches!(message, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP) {
             count(data);
-            record(data, (wparam.0 & POINTER_ID_MASK) as u32);
+            let id = (wparam.0 & POINTER_ID_MASK) as u32;
+            // **접촉 중인가**(`POINTER_FLAG_INCONTACT`): 호버 업데이트까지 프레임으로 만들면
+            // 공중에 띄운 펜이 마우스 드래그에 "펜 자격"을 붙인다(거짓). DOWN/UP은 접촉의
+            // 시작·끝 그 자체라 그대로 받는다.
+            if message != WM_POINTERUPDATE || in_contact(id) {
+                record(data, id);
+            }
         }
         unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+
+    /// 접촉 중인가 — `POINTER_INFO.pointerFlags & POINTER_FLAG_INCONTACT`.
+    ///
+    /// 못 읽으면 **막지 않는다**: 정보가 없다고 입력을 버리는 것이 더 나쁘다.
+    fn in_contact(id: u32) -> bool {
+        let mut info = POINTER_INFO::default();
+        if unsafe { GetPointerInfo(id, &mut info) }.is_err() {
+            return true;
+        }
+        info.pointerFlags.0 & POINTER_FLAG_INCONTACT.0 != 0
     }
 
     /// 이 창이 메시지를 받았다 — **어느 창으로 오는가**가 진단의 답이다(참조 데이터 = 목록 인덱스).
@@ -584,7 +629,7 @@ mod win32 {
             Ok(()) if kind == PT_TOUCH => Device::Touch,
             _ => Device::Mouse,
         };
-        let (pressure, tilt) = if device == Device::Pen {
+        let (pressure, tilt, pose) = if device == Device::Pen {
             SEEN_PEN.set(true);
             // 진단: **어느 창으로 펜이 왔는가**(창마다 세면 훅 자리가 드러난다).
             PROBES.with(|slots| {
@@ -594,21 +639,33 @@ mod win32 {
             });
             pen_info(id)
         } else {
-            (None, None)
+            (None, None, Pose::default())
         };
-        LATEST.set(Some(PointerFrame::new(
-            device,
-            pressure,
-            tilt,
-            Instant::now(),
-        )));
+        LATEST.set(Some(
+            PointerFrame::new(device, pressure, tilt, Instant::now()).with_pen_pose(
+                pose.inverted,
+                pose.has_eraser,
+                pose.rotation,
+            ),
+        ));
     }
 
-    /// `POINTER_PEN_INFO` → (압력, 틸트) — **장치가 보고한 것만** `Some`이다(`penMask`).
-    fn pen_info(id: u32) -> (Option<f32>, Option<(f32, f32)>) {
+    /// `penFlags`/`PEN_MASK_ROTATION`을 읽은 **펜의 자세** — 플랫폼 상수는 여기서만 만진다.
+    #[derive(Clone, Copy, Default)]
+    struct Pose {
+        /// 뒤집힘(`PEN_FLAG_INVERTED`) — 지우개 끝으로 쓰는 중.
+        inverted: bool,
+        /// 장치에 지우개 끝이 있는가(`PEN_FLAG_ERASER`).
+        has_eraser: bool,
+        /// 회전(0~359도, `PEN_MASK_ROTATION`).
+        rotation: Option<f32>,
+    }
+
+    /// `POINTER_PEN_INFO` → (압력, 틸트, 자세) — **장치가 보고한 것만** `Some`이다(`penMask`).
+    fn pen_info(id: u32) -> (Option<f32>, Option<(f32, f32)>, Pose) {
         let mut info = POINTER_PEN_INFO::default();
         if unsafe { GetPointerPenInfo(id, &mut info) }.is_err() {
-            return (None, None);
+            return (None, None, Pose::default());
         }
         let pressure = (info.penMask & PEN_MASK_PRESSURE != 0)
             .then(|| input::pressure_from_raw(info.pressure));
@@ -619,6 +676,14 @@ mod win32 {
                 input::tilt_from_raw(info.tiltY),
             )
         });
-        (pressure, tilt)
+        // `penFlags`는 장치의 **자세**다: 뒤집힘(지우개 끝으로 쓰는 중)과 지우개 끝의 유무.
+        let pose = Pose {
+            inverted: info.penFlags & PEN_FLAG_INVERTED != 0,
+            has_eraser: info.penFlags & PEN_FLAG_ERASER != 0,
+            // 0도와 "보고하지 않음"은 값으로 구분할 수 없다 — 무선(mask)으로 가른다.
+            rotation: (info.penMask & PEN_MASK_ROTATION != 0)
+                .then(|| input::rotation_from_raw(info.rotation)),
+        };
+        (pressure, tilt, pose)
     }
 }

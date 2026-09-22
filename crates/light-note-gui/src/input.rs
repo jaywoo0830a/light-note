@@ -65,16 +65,33 @@ impl Device {
     }
 }
 
-/// 하드웨어가 알려 준 **한 포인터 프레임**(장치·필압·틸트) — [`crate::digitizer`]가 채운다.
+/// 하드웨어가 알려 준 **한 포인터 프레임**(장치·필압·틸트·**펜의 자세**) — [`crate::digitizer`]가 채운다.
 ///
-/// Win32 `POINTER_PEN_INFO`의 계약을 그대로 옮긴다: 압력 0~1024 → 0.0~1.0, 틸트 -90~90도.
-/// **장치가 보고하지 않은 값은 `None`이다**(`penMask`) — 0으로 채우면 "압력 0"과
-/// "압력을 안 보내는 장치"를 구분할 수 없다.
+/// Win32 `POINTER_PEN_INFO`의 계약을 그대로 옮긴다(공식 문서의 범위와 자격 규칙):
+///
+/// | 필드 | 문서 | 우리 쪽 |
+/// |---|---|---|
+/// | `pressure` | 0~1024, **`PEN_MASK_PRESSURE`일 때만 유효**(없으면 기본 0) | [`pressure_from_raw`] → 0.0~1.0 |
+/// | `tiltX`/`tiltY` | −90~+90(오른쪽·사용자 쪽이 +) | [`tilt_from_raw`] → 도, 두 축이 **둘 다** 있을 때만 `Some` |
+/// | `rotation` | 0~359도(시계 방향), **`PEN_MASK_ROTATION`일 때만 유효** | [`rotation_from_raw`] → 도, 진단에만 쓴다 |
+/// | `penFlags` | `PEN_FLAG_*`의 조합(0 가능) | [`PointerFrame::with_pen_pose`] → [`PointerFrame::inverted`] / [`PointerFrame::has_eraser`] |
+///
+/// **장치가 보고하지 않은 값은 `None`이다** — 0으로 채우면 "압력 0"과 "압력을 안 보내는
+/// 장치"를 구분할 수 없다(그래서 문서가 말하는 "기본 0"을 그대로 쓰지 않는다).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerFrame {
     pub device: Device,
     pub pressure: Option<f32>,
     pub tilt: Option<(f32, f32)>,
+    /// 펜을 **뒤집어** 쓰는 중인가(`PEN_FLAG_INVERTED`) — 지우개 끝이다.
+    ///
+    /// 이 한 점이 획의 성격을 바꾼다([`crate::tool::CanvasTool::press_inverted`]): 뒤집힌 펜은
+    /// **지운다**. 도구 선택을 바꾸지 않고 그 제스처만 지운다 — 뒤집기를 풀면 원래 도구다.
+    pub inverted: bool,
+    /// 펜에 **지우개 끝이 있는가**(`PEN_FLAG_ERASER`) — 장치의 능력이다(자세가 아니다).
+    pub has_eraser: bool,
+    /// 장치가 보고한 **회전**(0~359도, `PEN_MASK_ROTATION`) — 지금은 진단에만 쓴다.
+    pub rotation: Option<f32>,
     pub at: Instant,
 }
 
@@ -94,8 +111,25 @@ impl PointerFrame {
             device,
             pressure,
             tilt,
+            inverted: false,
+            has_eraser: false,
+            rotation: None,
             at,
         }
+    }
+
+    /// **펜의 자세**(`penFlags`/`PEN_MASK_ROTATION`)를 싣는다 — [`crate::digitizer`]가 창 프로시저에서
+    /// 디코드해 넘긴다(플랫폼 상수는 저쪽에만 있다).
+    pub fn with_pen_pose(
+        mut self,
+        inverted: bool,
+        has_eraser: bool,
+        rotation: Option<f32>,
+    ) -> Self {
+        self.inverted = inverted;
+        self.has_eraser = has_eraser;
+        self.rotation = rotation;
+        self
     }
 
     /// 지금(`now`) 표본의 재료로 쓸 수 있는가.
@@ -137,6 +171,13 @@ impl Sample {
     pub fn tilt(self) -> Option<(f32, f32)> {
         self.frame.and_then(|frame| frame.tilt)
     }
+
+    /// 펜을 **뒤집었는가**(`PEN_FLAG_INVERTED`) — 이 표본은 **지운다**(①이 아니라 ②의 정책).
+    ///
+    /// 장치를 모르는 표본은 뒤집힐 수도 없다(`None` → `false`).
+    pub fn inverted(self) -> bool {
+        self.frame.is_some_and(|frame| frame.inverted)
+    }
 }
 
 /// WinUI DIP 좌표 → 표본(pt). **변환은 이 함수 하나뿐이다.**
@@ -171,6 +212,13 @@ pub fn pressure_from_raw(raw: u32) -> f32 {
 /// Win32 틸트(-90~90도) → 도. `POINTER_PEN_INFO.tiltX/tiltY`의 계약 그대로다.
 pub fn tilt_from_raw(raw: i32) -> f32 {
     (raw as f32).clamp(-90.0, 90.0)
+}
+
+/// Win32 회전(0~359도, 시계 방향) → 도. `POINTER_PEN_INFO.rotation`의 계약 그대로다.
+///
+/// 문서가 범위를 0~359로 못박으므로 **한 바퀴로 접는다**(360을 보고하는 장치가 있어도 각도다).
+pub fn rotation_from_raw(raw: u32) -> f32 {
+    (raw % 360) as f32
 }
 
 /// 표면이 호스트에 포인터를 알리는 통로 — 자기 메시지 큐로 옮긴다.

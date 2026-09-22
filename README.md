@@ -16,7 +16,10 @@
   최소/처음 크기 제약, **PDF를 창에 끌어놓으면 열린다**(공식 `drag-drop` 패턴).
 - **입력 진단**: 툴바의 **Diagnostics** 버튼이 개발자 도구를 연다 — 화면에서 펜 입력의 **세 관문**
   (펜 하드웨어 · 훅이 걸린 창 · 도착한 펜 메시지)과 창마다의 도착 수를 표로 보고, 늦게 생긴 창을
-  줍는 **Rescan**을 누를 수 있다(`digitizer::Digest`).
+  줍는 **Rescan**을 누를 수 있다(`digitizer::Digest`). 표는 `POINTER_PEN_INFO`의 자세까지 읽는다:
+  **뒤집힘**(`PEN_FLAG_INVERTED`) · 지우개 끝의 유무 · 회전.
+- **펜을 뒤집으면 지운다**: `PEN_FLAG_INVERTED`가 켜진 동안의 제스처는 **그 제스처만** 지운다 —
+  도구 선택은 안 바뀌므로 뒤집기를 풀면 고른 도구로 계속 그린다(지우는 규칙은 지우개 도구와 같다).
 
 ## 구조 — 크레이트 하나, 파이프라인 하나
 
@@ -169,7 +172,7 @@ Border (루트: PDF 끌어놓기 — 공식 drag-drop 패턴)              app.r
 cargo test -p light-note-gui
 ```
 
-90개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
+93개 테스트가 **화면 계약과 인코딩 규칙까지** 검증한다:
 
 - `pipeline` — ①표본 정규화(표면 DIP → pt)·**펜 프레임**(장치·필압·틸트, 낡은 프레임은 버림)
   ②드래그 하나 = 편집 하나·취소는 흔적 없음·**펜만 필기**(마우스·손가락은 무시)·**필압이
@@ -257,6 +260,7 @@ Set-Content -LiteralPath .\new.ps1 -Encoding utf8BOM -Value $text   # 5.1/7 공�
 | `System digitizer` | `none reported`면 **하드웨어가 없다** — 마우스·터치로는 잉크가 안 나온다(정책이다) |
 | `Hook` | `hooked on N of M window(s)` — M이 N보다 크면 훅을 못 건 창이 있다. `Rescan`이 늦게 생긴 창을 줍는다 |
 | `Pen frames` / `WM_POINTER messages` | `no pointer message has arrived at all`이면 훅 자리가 틀렸고, `none of them a pen`이면 펜이 아닌 입력만 오고 있다 |
+| `Last frame` | 장치 · 필압 · 틸트 · **자세**(`flipped (erasing)` · `eraser tip` · `rotation`) · 나이(ms) — `POINTER_PEN_INFO`가 보고한 것만 적는다 |
 | 창마다 한 줄 | `msgs`/`pen`이 **어느 창으로** 입력이 오는지 말한다 — WinUI 3의 자식 콘텐츠 창에 0이 찍히면 그 창에 못 걸린 것이다 |
 | `WinUI pointer events` | 훅과 무관하게 **UI 경로가 살아 있는지**를 가른다(0이면 문제는 훅이 아니다) |
 

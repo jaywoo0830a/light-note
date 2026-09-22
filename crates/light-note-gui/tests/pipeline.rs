@@ -136,9 +136,77 @@ fn stage1_win32_pen_values_keep_their_contract() {
     assert_eq!(input::tilt_from_raw(-90), -90.0);
     assert_eq!(input::tilt_from_raw(0), 0.0);
     assert_eq!(input::tilt_from_raw(120), 90.0);
+    // 회전은 0~359도(시계 방향) — 범위 밖은 한 바퀴로 접는다.
+    assert_eq!(input::rotation_from_raw(0), 0.0);
+    assert_eq!(input::rotation_from_raw(90), 90.0);
+    assert_eq!(input::rotation_from_raw(359), 359.0);
+    assert_eq!(input::rotation_from_raw(360), 0.0);
+}
+
+#[test]
+fn stage1_a_flipped_pen_says_so() {
+    // `PEN_FLAG_INVERTED`는 프레임의 **자세**로 온다 — ②가 그 자세를 정책으로 바꾼다(지우기).
+    let flipped = PointerFrame::new(Device::Pen, Some(0.5), None, Instant::now()).with_pen_pose(
+        true,
+        true,
+        Some(90.0),
+    );
+    let sample = input::sample_with(
+        Phase::Pressed,
+        0.0,
+        0.0,
+        Scale::from_zoom(100.0),
+        Some(flipped),
+    );
+    assert!(sample.inverted(), "뒤집힘은 프레임이 들고 온다");
+    assert!(sample.is_ink(), "뒤집힌 펜도 **펜**이다(자격은 그대로)");
+    assert_eq!(sample.pressure(), Some(0.5), "뒤집혀도 필압은 필압이다");
+    assert_eq!(flipped.rotation, Some(90.0));
+    assert!(flipped.has_eraser, "지우개 끝의 유무는 장치의 능력이다");
+
+    // 뒤집히지 않은 펜도, 장치를 모르는 입력도 뒤집힘이 아니다.
+    let plain = PointerFrame::new(Device::Pen, None, None, Instant::now());
+    let straight = input::sample_with(
+        Phase::Pressed,
+        0.0,
+        0.0,
+        Scale::from_zoom(100.0),
+        Some(plain),
+    );
+    assert!(!straight.inverted());
+    assert!(!input::sample(Phase::Pressed, 0.0, 0.0, Scale::from_zoom(100.0)).inverted());
 }
 
 // ── ② CanvasTool ────────────────────────────────────────────────────
+
+#[test]
+fn stage2_a_flipped_pen_erases_without_changing_the_tool() {
+    // `PEN_FLAG_INVERTED` — 펜을 뒤집으면 **그 제스처만** 지운다: 도구 선택은 그대로라
+    // 뒤집기를 풀면 원래 도구로 계속 그린다. 지우는 규칙은 지우개 도구와 **같은 길**이다.
+    let mut canvas = Canvas::new(Size::A4);
+    let mut tool = CanvasTool::new();
+    draw(
+        &mut tool,
+        &mut canvas,
+        &line(Pt::new(10.0, 10.0), Pt::new(60.0, 10.0), 8),
+    );
+    assert_eq!(canvas.doc().strokes().len(), 1);
+
+    // 뒤집힌 펜으로 문지른다 — 획이 **안 생기고** 있던 획이 사라진다.
+    tool.press_inverted(canvas.doc_mut(), Pt::new(10.0, 10.0), at(0), Some(0.5));
+    tool.drag_with(canvas.doc_mut(), Pt::new(60.0, 10.0), at(8), Some(0.5));
+    let edit = tool.lift(canvas.doc_mut());
+    assert!(
+        matches!(edit, Some(Edit::RemoveStrokes { .. })),
+        "뒤집힌 펜은 지운다"
+    );
+    assert_eq!(canvas.doc().strokes().len(), 0);
+    assert_eq!(tool.tool(), Tool::Pen, "도구 선택은 바뀌지 않는다");
+
+    // 되돌리기 **한 번**으로 돌아온다(지우개와 같은 편집 하나).
+    canvas.edit(|doc| doc.undo());
+    assert_eq!(canvas.doc().strokes().len(), 1);
+}
 
 #[test]
 fn stage2_only_the_pen_is_accepted() {

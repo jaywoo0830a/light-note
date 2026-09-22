@@ -47,7 +47,7 @@ scale = Scale::DEFAULT(1.5) × zoom/100        // 1pt = scale 픽셀
 | ③ 캔버스 | 문서 + **구운 접두사**(`Base`) + **꼬리**(`Rc<[LiveInk]>`) | `src/canvas.rs` |
 | 모델 | 페이지·획·Undo/Redo | `src/doc.rs`, `src/ink.rs` |
 | 기하/래스터 | 도형 결정(`ink_shape`) + 픽셀화 | `src/shape.rs` |
-| 입력 | 표면 DIP → pt, 위상, **장치·필압·틸트** | `src/input.rs`, `src/digitizer.rs` |
+| 입력 | 표면 DIP → pt, 위상, **장치·필압·틸트·자세**(`penFlags`) | `src/input.rs`, `src/digitizer.rs` |
 | 도구 | press/drag/lift/cancel, **펜만 필기**, 압력(필압, 없으면 속도) | `src/tool.rs` |
 
 **스레드 2개만 있다**: UI 스레드(= Reactor 메시지 루프 + elm 프레임)와 백그라운드 워커
@@ -387,6 +387,9 @@ Grid                        key_accelerators(Ctrl+±, Ctrl+Enter) — 루트(app
 | 표면은 `<Raw>` **하나**로 붙고 재료가 그대로 도착 | `ui_plan::the_surface_reaches_the_registered_builder_through_one_raw_slot` |
 | 화면 언어는 **영어만** | `ui_plan::every_visible_string_is_english_only` |
 | 진단 표가 **세 관문**을 정확히 말한다(펜 유무·창별 도착 수·훅 상태) | `digitizer::*` |
+| Win32 펜 값의 계약(압력 0~1024·틸트 ±90·회전 0~359) | `pipeline::stage1_win32_pen_values_keep_their_contract` |
+| 프레임의 **자세**(뒤집힘·지우개 끝·회전)가 표에 그대로 나온다 | `digitizer::the_frame_line_reports_the_pen_pose` |
+| 뒤집힌 펜은 **그 제스처만** 지운다(도구 선택은 그대로) | `pipeline::stage2_a_flipped_pen_erases_without_changing_the_tool` |
 | 진단 패널은 정보 띠와 본문 **사이**에 선다(아래면 잘려 안 보인다) | `ui_plan::the_dev_panel_follows_the_host_flag` |
 | 토큰 규칙(4 DIP 리듬·타이포 내림차순·알약 관례·컨트롤 눈금) | `style::*` |
 | 인코딩 계약(BOM·UTF-8·CRLF) | `encoding::*` |
