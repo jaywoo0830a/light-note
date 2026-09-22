@@ -386,9 +386,9 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "elm-magic"
-version = "0.8.7"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82d8ca2a5aa5edf4d45937e0c3a96538089c82f6f896a2ca5a38d20937dddb47"
+checksum = "9c4ee08b66b2d339ef5364ec3dc5567ab9bc7ffeffc41bdc9c6e12fe0246d06e"
 dependencies = [
  "elm-magic-macros",
  "enum_dispatch",
@@ -396,15 +396,15 @@ dependencies = [
 
 [[package]]
 name = "elm-magic-macros"
-version = "0.8.7"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd02dcf74e3617c6bbc8ad2ca4655a0fbb4a6ee46bedbcb2d5cfd62563022dc1"
+checksum = "24d042fa8fb384e3906cac489456f2bca36459853b3c0678f4905ab2588ec72e"
 
 [[package]]
 name = "elm-magic-windows-reactor"
-version = "0.8.7"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03f9faac744a4c9a3f2bcbdcd2d6429e5cb64a60e944ed82d2ddcb533a2f4094"
+checksum = "5280b90696ddd6f29e36b6e65099bcf362ac64949a63b3c29f275d7fa5c2a25c"
 dependencies = [
  "elm-magic",
  "windows-reactor",
