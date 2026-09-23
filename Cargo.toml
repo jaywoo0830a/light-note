@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/light-note"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+
+[workspace.dependencies]
+elm-magic = "0.8.9"
+elm-magic-windows-reactor = "0.8.9"
+windows-reactor = "0.100"
+# PDF: Pdfium (the engine behind Chrome's PDF viewer), bound at run time.
+# `default-features = false` drops pdfium-render's `image` feature: the app
+# converts Pdfium bitmaps into its own raster type, so it does not need it.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+vello_cpu = "0.2.0"
+rfd = "0.17.2"
+windows = "0.62.2"
+thiserror = "2.0.20"
+serde_json = "1.0.145"
+anyhow = "1.0.104"
+# Settings and the ink sidecar of a note (`serde` + JSON).  `derive` gives the
+# `Serialize`/`Deserialize` macros the core uses.
+serde = { version = "1.0.229", features = ["derive"] }

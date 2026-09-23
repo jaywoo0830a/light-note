@@ -1,0 +1,46 @@
+[package]
+name = "light-note"
+description = "light-note — a Windows 11 note-taking app for drawing pads (pdfium-render + elm-magic)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The core (`geom`, `ink`, `shape`, `doc`, `otd`, `display`, `inbox`, `pdf`) is
+# platform independent and is developed test-first — see `tests/`.  The UI layer
+# (`screen`, `surface`, `chrome`, `shell`) is Windows only and is deliberately
+# untested: it is a pure translation of state into WinUI controls.
+[lib]
+name = "light_note"
+path = "src/lib.rs"
+
+[dependencies]
+# CPU rasterizer for ink.  Re-exports `kurbo` (paths) and `peniko` (color), so
+# the raster layer and the live-shape layer share one geometry type.
+vello_cpu.workspace = true
+# PDF: Pdfium (the engine behind Chrome's PDF viewer), bound at run time.
+# `default-features = false` keeps the `image` crate out of the build — the app
+# converts Pdfium bitmaps itself, in its own raster type.
+pdfium-render.workspace = true
+# Core errors are concrete (`thiserror`), never stringly typed.
+thiserror.workspace = true
+# Settings and the ink sidecar of a note (`serde` + JSON).
+serde.workspace = true
+serde_json.workspace = true
+
+# Windows 11 only: the UI layer (WinUI 3) and the input layer (Win32
+# memory-mapped file, display refresh rate) are both Windows APIs, so the crate
+# does not pretend to be portable.  `cargo test` still runs headlessly: the
+# model, geometry, protocol and clock layers have no platform dependency.
+[target.'cfg(windows)'.dependencies]
+elm-magic.workspace = true
+elm-magic-windows-reactor.workspace = true
+windows-reactor.workspace = true
+rfd.workspace = true
+# Error context for the app layer: workers, startup, dialogs.
+anyhow.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Performance"] }
+
+[[bin]]
+name = "light-note"
+path = "src/main.rs"
