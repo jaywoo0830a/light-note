@@ -111,6 +111,42 @@ fn a_waiter_wakes_up_when_a_message_arrives() {
 }
 
 #[test]
+fn a_pump_can_wait_for_a_message_without_taking_it() {
+    // The UI is woken by a background task that parks on the inbox.  That task
+    // must not *consume* what it was woken for: the message has to still be
+    // there for the UI thread to drain.  (A pump that eats its own wakeup loses
+    // one pen sample per frame — which is exactly what the drawing looked like.)
+    let inbox = Inbox::<u32>::new();
+    let waiter = {
+        let inbox = Arc::clone(&inbox);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            inbox.wait_ready();
+            started.elapsed()
+        })
+    };
+
+    std::thread::sleep(Duration::from_millis(30));
+    inbox.push(11);
+
+    let waited = waiter.join().expect("waiter");
+    assert!(waited >= Duration::from_millis(20), "woken by the push, not by a poll");
+    assert_eq!(inbox.try_pop(), Some(11), "waiting does not consume the message");
+}
+
+#[test]
+fn waiting_for_a_message_that_is_already_there_returns_at_once() {
+    let inbox = Inbox::<u32>::new();
+    inbox.push(1);
+
+    let started = Instant::now();
+    inbox.wait_ready();
+
+    assert!(started.elapsed() < Duration::from_millis(20), "no wait when work is queued");
+    assert_eq!(inbox.try_pop(), Some(1));
+}
+
+#[test]
 fn an_inbox_is_shared_between_threads() {
     // The handle is `Arc<Inbox<T>>`: cheap to clone, `Send + Sync`, and the
     // payload only has to be `Send`.

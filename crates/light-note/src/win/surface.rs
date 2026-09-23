@@ -48,6 +48,9 @@ const MOUSE_PRESSURE: f32 = 0.5;
 /// is called (with the buffer index) when WinUI has finished decoding a buffer,
 /// which is the only moment it is safe to show it.  `on_pointer` receives the
 /// fallback input (a mouse, or a pen without OTD) in page DIPs.
+///
+/// Returns the view and the number of live shapes in it: the count is what the
+/// UI thread pays per frame, so the diagnostics report it instead of guessing.
 pub fn build(
     page_px: (f64, f64),
     buffers: &[Buffer; 2],
@@ -56,7 +59,7 @@ pub fn build(
     scale: Scale,
     on_decoded: std::rc::Rc<dyn Fn(usize)>,
     on_pointer: std::rc::Rc<dyn Fn(PointerPhase, f64, f64, f32)>,
-) -> View {
+) -> (View, usize) {
     let (width, height) = page_px;
 
     let slot = |index: usize, buffer: &Buffer| -> View {
@@ -82,6 +85,7 @@ pub fn build(
             shapes.push(piece_view(piece, stroke.style().color));
         }
     }
+    let live_count = shapes.len();
 
     // Two image layers plus the live shapes.  The children are keyed, so a
     // frame that adds one segment adds one element instead of rebuilding the
@@ -113,17 +117,19 @@ pub fn build(
         }
     };
 
-    Border::new()
-        .width(width)
-        .height(height)
-        // The sheet is centered on the desk (the desk is bigger than the page).
-        .horizontal_alignment(HorizontalAlignment::Center)
-        .vertical_alignment(VerticalAlignment::Center)
-        .on_pointer_pressed(event(PointerPhase::Pressed))
-        .on_pointer_moved(event(PointerPhase::Moved))
-        .on_pointer_released(event(PointerPhase::Released))
-        .content(canvas)
-        .into()
+    (
+        Border::new()
+            .width(width)
+            .height(height)
+            // The sheet is centered on the desk (the desk is bigger than the page).
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .on_pointer_pressed(event(PointerPhase::Pressed))
+            .on_pointer_moved(event(PointerPhase::Moved))
+            .on_pointer_released(event(PointerPhase::Released))
+            .content(canvas),
+        live_count,
+    )
 }
 
 /// One live shape as a WinUI control.

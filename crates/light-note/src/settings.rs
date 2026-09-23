@@ -110,12 +110,25 @@ impl Settings {
         })
     }
 
-    /// `%APPDATA%\light-note\settings.json`.
-    pub fn path() -> PathBuf {
+    /// `%APPDATA%\light-note` — where the app's own files live.
+    pub fn dir() -> PathBuf {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        base.join("light-note").join("settings.json")
+        base.join("light-note")
+    }
+
+    /// `%APPDATA%\light-note\settings.json`.
+    pub fn path() -> PathBuf {
+        Self::dir().join("settings.json")
+    }
+
+    /// `%APPDATA%\light-note\debug.log` — the trace the "Log" button writes.
+    ///
+    /// It sits next to `settings.json` so there is one place to look, and it is
+    /// **not** a settings field: a log is per-run evidence, not a preference.
+    pub fn debug_path() -> PathBuf {
+        Self::dir().join("debug.log")
     }
 
     /// Snaps and clamps everything that has a legal range.

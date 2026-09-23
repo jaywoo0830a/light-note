@@ -79,6 +79,7 @@ elm_magic::view! {
             <Row>
                 <Button on_click={on_intent(Intent::ToggleHelp)}>"Help"</Button>
                 <Button on_click={on_intent(Intent::ToggleDev)}>"Diagnostics"</Button>
+                <Button on_click={on_intent(Intent::ToggleTrace)}>"Log"</Button>
                 <Button on_click={on_intent(Intent::RescanTablet)}>"Rescan tablet"</Button>
                 <Button on_click={on_intent(Intent::Quit)}>"Quit"</Button>
             </Row>

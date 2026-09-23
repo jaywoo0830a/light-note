@@ -88,6 +88,19 @@ fn a_manual_rate_is_snapped_when_it_is_loaded() {
 }
 
 #[test]
+fn the_debug_log_lives_next_to_the_settings_file() {
+    // One place to look for the app's own files, and a log path that cannot
+    // accidentally be a settings field (it is evidence per run, not a preference).
+    let dir = Settings::dir();
+    assert!(Settings::path().starts_with(&dir), "{:?}", Settings::path());
+    assert_eq!(
+        Settings::debug_path(),
+        dir.join("debug.log"),
+        "the log sits beside settings.json"
+    );
+}
+
+#[test]
 fn the_pen_width_is_kept_inside_a_writable_range() {
     let json = r#"{"pen_width_pt": 900.0, "highlighter_width_pt": -3.0, "eraser_radius_pt": 0.0}"#;
     let settings = Settings::from_json(json).expect("parse");

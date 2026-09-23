@@ -17,6 +17,7 @@
 //! shows the worst one next to the frame budget, so "the UI never blocks" is a
 //! number on screen and not a promise.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,10 +26,10 @@ use std::time::{Duration, Instant};
 use elm_magic::Callback;
 use elm_magic_windows_reactor::{ElmInput, ElmView};
 use windows_reactor::{
-    Border, Brush, ChildrenControl, Color, Component, ComponentContext, ContentControl,
-    DragDropAction, DragDropOperation, DragDropPolicy, DroppedData, HorizontalAlignment,
-    LayoutControl, Orientation, StackPanel, Thickness, View, ViewContext, WindowBackdrop,
-    WindowVisuals,
+    Border, Brush, ChildrenControl, Color, Component, ComponentContext, ComponentTaskStatus,
+    ContentControl, DragDropAction, DragDropOperation, DragDropPolicy, DroppedData,
+    HorizontalAlignment, LayoutControl, Orientation, StackPanel, Thickness, View, ViewContext,
+    WindowBackdrop, WindowVisuals,
 };
 
 use super::screen::{Screen, ScreenProps};
@@ -65,6 +66,77 @@ const SCREEN_HEIGHT: f64 = 360.0;
 /// The desk's padding around the sheet.
 const DESK_PADDING: f64 = 12.0;
 
+/// How many event lines the trace writes before it stops (the once-a-second
+/// summary keeps going, so the shape of a long session is never lost).
+const TRACE_EVENT_CAP: u32 = 6000;
+
+/// A gap between two pen reports that means "the stream stopped, not the pen".
+/// The same 20 ms the trace calls a gap — below it, a 250 Hz tablet simply
+/// missed a report or two.
+const TRACE_GAP_MS: f32 = 20.0;
+
+/// One second of counters: what the app did, and what it cost.
+///
+/// The numbers are chosen so that every "it stutters" has one place to look:
+/// `ticks` vs `views` (is the loop being paced but not drawn?), `commits` vs
+/// `points` (is a stroke being cut into dashes?), `bakes` vs `landed` vs
+/// `dropped` (is the page bitmap stale?).
+#[derive(Clone, Copy, Debug, Default)]
+struct Stats {
+    /// `update` calls (one per message the UI thread applied).
+    updates: u64,
+    /// Messages seen, by kind.
+    msgs: u64,
+    ticks: u64,
+    batches: u64,
+    intents: u64,
+    /// Pen samples applied, and the strokes they turned into.
+    samples: u64,
+    commits: u64,
+    points: u64,
+    /// Why a stroke ended: a stale gap / the tip flag / out-of-range.
+    stale: u64,
+    tip_up: u64,
+    out_of_range: u64,
+    /// Reports whose timestamp jumped more than [`TRACE_GAP_MS`].
+    gaps: u64,
+    gap_worst_ms: f32,
+    /// Samples the reader never saw (the ring overflowed).
+    skipped: u64,
+    /// Bake pipeline: asked, finished, and thrown away as stale.
+    bakes: u64,
+    bakes_landed: u64,
+    bakes_dropped: u64,
+    bake_ms: f32,
+    decodes: u64,
+    swaps: u64,
+    /// Views composed and what they cost.
+    views: u64,
+    view_ms: f32,
+    view_worst_ms: f32,
+    /// The gap between two views — the real render cadence.
+    frame_gap_ms: f32,
+    frame_gap_worst_ms: f32,
+    /// Live shapes handed to WinUI in the last frame.
+    live_pieces: usize,
+}
+
+impl Stats {
+    /// Forgets everything (after a summary line has been written).
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A rate per second.
+    fn rate(count: u64, seconds: f32) -> f32 {
+        if seconds <= 0.0 {
+            0.0
+        } else {
+            count as f32 / seconds
+        }
+    }
+}
+
 /// The host component.
 pub struct Shell {
     inbox: Arc<Inbox<HostMessage>>,
@@ -90,6 +162,31 @@ pub struct Shell {
     rescan: Arc<AtomicBool>,
     samples: u64,
     skipped: u64,
+
+    // ── trace ──────────────────────────────────────────────────────────────
+    /// Write the debug log (the "Log" button flips this).
+    trace: bool,
+    /// Event lines written since the trace started (capped, see [`TRACE_EVENT_CAP`]).
+    trace_events: u32,
+    /// The previous report's timestamp and whether the tip was down — the two
+    /// values that turn a stream into "a stroke" or "dashes".
+    seen_time: u64,
+    seen_down: Option<bool>,
+    /// How long the current tip-down / tip-up run has been going (reports), and
+    /// what it looked like: the first/last pressure and where it started.
+    run_len: u32,
+    run_pressure: (f32, f32),
+    run_from: (f32, f32),
+    /// One second of counters, and when that second started.
+    stats: Stats,
+    stats_since: Instant,
+    /// Timings the `view` method owns (`view` takes `&self`, so they are `Cell`s).
+    view_calls: Cell<u64>,
+    view_ns: Cell<u64>,
+    view_worst_ns: Cell<u64>,
+    last_view: Cell<Option<Instant>>,
+    view_gap_worst_ms: Cell<f32>,
+    live_pieces: Cell<usize>,
 
     // ── screen ─────────────────────────────────────────────────────────────
     buffers: [Buffer; 2],
@@ -171,6 +268,21 @@ impl Component for Shell {
             rescan,
             samples: 0,
             skipped: 0,
+            trace: true,
+            trace_events: 0,
+            seen_time: 0,
+            seen_down: None,
+            run_len: 0,
+            run_pressure: (0.0, 0.0),
+            run_from: (0.0, 0.0),
+            stats: Stats::default(),
+            stats_since: Instant::now(),
+            view_calls: Cell::new(0),
+            view_ns: Cell::new(0),
+            view_worst_ns: Cell::new(0),
+            last_view: Cell::new(None),
+            view_gap_worst_ms: Cell::new(0.0),
+            live_pieces: Cell::new(0),
             buffers: [Buffer::default(), Buffer::default()],
             active: 0,
             generation: 0,
@@ -204,12 +316,17 @@ impl Component for Shell {
         shell.refit();
         shell.request_bake();
         shell.arm_pump(context);
+        // The header of the debug log: everything needed to read the numbers
+        // below it (the tablet's range arrives later, and is logged then).
+        shell.trace_session();
         let _ = margin;
         shell
     }
 
     fn update(&mut self, message: HostMessage, context: &ComponentContext<Self>) {
         let started = Instant::now();
+        self.stats.updates += 1;
+        self.stats.msgs += 1;
         match message {
             HostMessage::Wake => {
                 self.pump_armed = false;
@@ -227,6 +344,7 @@ impl Component for Shell {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+        let view_started = Instant::now();
         let view_model = self.view_model();
         context.window_title("light-note");
         context.window_visuals(
@@ -258,7 +376,7 @@ impl Component for Shell {
         };
 
         let page_px = self.page_pixels();
-        let page = surface::build(
+        let (page, live_count) = surface::build(
             page_px,
             &self.buffers,
             self.active,
@@ -267,6 +385,7 @@ impl Component for Shell {
             on_decoded,
             on_pointer,
         );
+        self.live_pieces.set(live_count);
 
         // The elm screen: toolbar, status, help and the diagnostics panel.
         let on_intent = Callback::new({
@@ -316,7 +435,7 @@ impl Component for Shell {
             .spacing(6.0)
             .children((desk, screen));
 
-        Border::new()
+        let view: View = Border::new()
             .padding(Thickness::uniform(8.0))
             .drop_policy(
                 DragDropPolicy::new().storage_items(
@@ -329,12 +448,150 @@ impl Component for Shell {
                     let _ = sender.send(HostMessage::Dropped(data));
                 }
             })
-            .content(column)
-            .into()
+            .content(column);
+
+        // The cost of one frame, measured where it is actually paid.  `update`
+        // only sees the message; the view is the half of the frame the UI thread
+        // spends building controls, and the gap between two views is the real
+        // render cadence (the loop rate is only what the ticker asked for).
+        let elapsed_ns = view_started.elapsed().as_nanos() as u64;
+        self.view_calls.set(self.view_calls.get() + 1);
+        self.view_ns.set(self.view_ns.get() + elapsed_ns);
+        self.view_worst_ns.set(self.view_worst_ns.get().max(elapsed_ns));
+        if let Some(last) = self.last_view.get() {
+            let gap_ms = view_started.saturating_duration_since(last).as_secs_f32() * 1000.0;
+            self.view_gap_worst_ms.set(self.view_gap_worst_ms.get().max(gap_ms));
+        }
+        self.last_view.set(Some(view_started));
+        view
     }
 }
 
 impl Shell {
+    // ── the debug trace ────────────────────────────────────────────────────
+    //
+    // A log is only useful if it answers a question.  This one is shaped by the
+    // two symptoms a drawing app can have: "the line broke into dashes" and "it
+    // stutters".  So it records (a) the *runs* of the pen stream — the input
+    // side, which the app cannot fix — and (b) every commit, bake and view, so
+    // the app side can be told apart from it.  One summary line per second keeps
+    // the shape of a long session without a line per sample.
+    //
+    // Everything goes through [`Workers::log`]: the UI thread formats a line and
+    // hands it over; the log worker owns the file.  No I/O here, ever.
+
+    /// The log's header: the environment the numbers below belong to.
+    fn trace_session(&mut self) {
+        if !self.trace {
+            return;
+        }
+        let hz = self.refresh.resolve(self.detected_hz);
+        let page = self.document.page().size;
+        let (width, height) = self.page_pixels();
+        let header = format!(
+            "settings: refresh {:?} · display {} Hz · loop {hz} Hz · tool {:?} · pen {:.1} pt · \
+             margin {:.0} pt\nwindow: client {:.0}x{:.0} dip · page {:.0}x{:.0} pt · scale {:.4} \
+             px/pt · page {:.0}x{:.0} px\ntrace: gap>{} ms · event lines capped at {TRACE_EVENT_CAP}",
+            self.refresh,
+            self.detected_hz,
+            self.tool,
+            self.width_for(self.tool),
+            self.settings.margin_pt,
+            self.client.width,
+            self.client.height,
+            page.width,
+            page.height,
+            self.scale.get(),
+            width,
+            height,
+            TRACE_GAP_MS,
+        );
+        self.workers.log(header);
+    }
+
+    /// Writes one event line, if tracing is on and the cap is not reached.
+    fn trace_line(&mut self, line: String) {
+        if !self.trace {
+            return;
+        }
+        if self.trace_events >= TRACE_EVENT_CAP {
+            if self.trace_events == TRACE_EVENT_CAP {
+                self.trace_events += 1;
+                self.workers.log(format!(
+                    "trace: event cap ({TRACE_EVENT_CAP} lines) reached — the 1 Hz summary keeps \
+                     going"
+                ));
+            }
+            return;
+        }
+        self.trace_events += 1;
+        self.workers.log(line);
+    }
+
+    /// One second of counters as one readable block.  This is the line to read
+    /// first: it says whether the loop is being paced but not drawn, and whether
+    /// a stroke is being cut into dashes.
+    fn trace_summary(&mut self, seconds: f32) {
+        if !self.trace {
+            return;
+        }
+        let stats = self.stats;
+        let rate = |count: u64| Stats::rate(count, seconds);
+        let average_points = if stats.commits == 0 {
+            0.0
+        } else {
+            stats.points as f32 / stats.commits as f32
+        };
+        let line = format!(
+            "── {seconds:.1} s ────────────────────────────────────────────────\n\
+             loop: ticks {:.0}/s · updates {:.0}/s · messages {:.0}/s (tablet {:.0}/s · intents {})\n\
+             ui:   views {:.0}/s · view {:.2} ms (worst {:.2}) · update {:.2} ms (worst {:.2}) · \
+             frame gap {:.1} ms (worst {:.1}) · live shapes {}\n\
+             pen:  samples {:.0}/s · commits {:.0}/s · points/stroke {:.1} · ended by stale {:.0}/s · \
+             tip-up {:.0}/s · out-of-range {:.0}/s · gaps>{}ms {:.0}/s (worst {:.1}) · skipped {}\n\
+             bake: asked {:.0}/s · landed {:.0}/s · dropped(stale) {:.0}/s · bake {:.1} ms · \
+             decodes {:.0}/s · swaps {:.0}/s",
+            rate(stats.ticks),
+            rate(stats.updates),
+            rate(stats.msgs),
+            rate(stats.batches),
+            stats.intents,
+            rate(stats.views),
+            if stats.views == 0 {
+                0.0
+            } else {
+                stats.view_ms / stats.views as f32
+            },
+            stats.view_worst_ms,
+            self.busy_ms,
+            self.worst_busy_ms,
+            stats.frame_gap_ms,
+            stats.frame_gap_worst_ms,
+            stats.live_pieces,
+            rate(stats.samples),
+            rate(stats.commits),
+            average_points,
+            rate(stats.stale),
+            rate(stats.tip_up),
+            rate(stats.out_of_range),
+            TRACE_GAP_MS,
+            rate(stats.gaps),
+            stats.gap_worst_ms,
+            stats.skipped,
+            rate(stats.bakes),
+            rate(stats.bakes_landed),
+            rate(stats.bakes_dropped),
+            if stats.bakes == 0 {
+                0.0
+            } else {
+                stats.bake_ms / stats.bakes as f32
+            },
+            rate(stats.decodes),
+            rate(stats.swaps),
+        );
+        self.workers.log(line);
+    }
+
     // ── the inbox: the only way in ─────────────────────────────────────────
 
     /// Parks one background task on the inbox.
@@ -342,21 +599,34 @@ impl Shell {
     /// The task blocks on a *worker* thread, so the UI thread is untouched; it
     /// returns the moment something arrives, which keeps the pen's latency at
     /// the reader's poll interval instead of a whole frame.
+    ///
+    /// It must **not** take the message it was woken for: the UI drains the inbox
+    /// with `try_pop`, and a pump that popped here would swallow one message per
+    /// wake — one tick (the frame rate would collapse) or one batch of pen
+    /// samples (the ink would break).  `wait_ready` is the non-consuming wait.
     fn arm_pump(&mut self, context: &ComponentContext<Self>) {
         if self.pump_armed {
             return;
         }
         let inbox = Arc::clone(&self.inbox);
-        let _ = context.spawn_background(move |_cancel| {
-            inbox.pop_blocking();
+        let task = context.spawn_background(move |_cancel| {
+            inbox.wait_ready();
             HostMessage::Wake
         });
+        // A rejected task never fires (the framework's bounded scheduler said
+        // no).  Leaving `pump_armed` set would mean the UI is never woken again —
+        // so the arm is only recorded when the task really is running, and the
+        // next message retries.
+        if task.status() == ComponentTaskStatus::Rejected {
+            return;
+        }
         self.pump_armed = true;
     }
 
     /// Drains everything the workers have produced.  Never waits.
     fn drain(&mut self) {
         while let Some(message) = self.inbox.try_pop() {
+            self.stats.msgs += 1;
             match message {
                 // The ticker posts into the same inbox as the workers, so a tick
                 // usually arrives *inside* a drain — it still has to count as a
@@ -381,10 +651,20 @@ impl Shell {
             } => self.pointer(x, y, pressure, phase),
             HostMessage::Baked(baked) => self.baked(baked),
             HostMessage::Decoded(slot) => {
+                let age_ms = self
+                    .baked_at
+                    .map(|at| at.elapsed().as_secs_f32() * 1000.0);
                 if let Some(buffer) = self.buffers.get_mut(slot) {
                     buffer.decoded = true;
                     self.active = slot;
                     self.baked_at = None;
+                    self.stats.decodes += 1;
+                    self.stats.swaps += 1;
+                    if let Some(age_ms) = age_ms {
+                        self.trace_line(format!(
+                            "decode: slot {slot} ready {age_ms:.1} ms after the bake — showing it"
+                        ));
+                    }
                 }
             }
             HostMessage::PdfOpened(result) => self.pdf_opened(result),
@@ -428,6 +708,34 @@ impl Shell {
             .record(now.saturating_duration_since(self.last_frame));
         self.last_frame = now;
         self.frame_count += 1;
+        self.stats.ticks += 1;
+
+        // The view timings live in `Cell`s (see the field comments): they are
+        // written by `view`, which only has `&self`.
+        self.stats.views = self.view_calls.get();
+        self.stats.view_ms = self.view_ns.get() as f32 / 1_000_000.0;
+        self.stats.view_worst_ms = self.view_worst_ns.get() as f32 / 1_000_000.0;
+        self.stats.frame_gap_worst_ms = self.view_gap_worst_ms.get();
+        self.stats.live_pieces = self.live_pieces.get();
+        if let Some(last) = self.last_view.get() {
+            self.stats.frame_gap_ms = now.saturating_duration_since(last).as_secs_f32() * 1000.0;
+        }
+
+        // One summary per second: the shape of the session, not a line per frame.
+        let elapsed = now.saturating_duration_since(self.stats_since);
+        if elapsed >= Duration::from_secs(1) {
+            self.trace_summary(elapsed.as_secs_f32());
+            // The window the summary described is over: start a fresh one, whether
+            // or not anything was written (so turning the trace on later shows
+            // *this* second, not the whole session).
+            self.stats.reset();
+            self.stats_since = now;
+            self.worst_busy_ms = 0.0;
+            self.view_calls.set(0);
+            self.view_ns.set(0);
+            self.view_worst_ns.set(0);
+            self.view_gap_worst_ms.set(0.0);
+        }
 
         let inactive = 1 - self.active;
         if let Some(baked_at) = self.baked_at
@@ -437,6 +745,11 @@ impl Shell {
             self.buffers[inactive].decoded = true;
             self.active = inactive;
             self.baked_at = None;
+            self.stats.swaps += 1;
+            self.trace_line(format!(
+                "swap: slot {inactive} shown by the decode grace ({:.1} ms after the bake)",
+                baked_at.elapsed().as_secs_f32() * 1000.0
+            ));
         }
     }
 
@@ -444,9 +757,22 @@ impl Shell {
 
     /// One delivery from the OTD reader thread.
     fn tablet(&mut self, batch: Batch) {
+        self.stats.batches += 1;
         if let Some(spec) = batch.spec {
             self.map = PageMap::fit(&spec, self.document.page().size, self.settings.margin_pt);
-            self.tablet = Some(spec);
+            self.tablet = Some(spec.clone());
+            let area = match &self.map {
+                Some(map) => {
+                    let (left, top) = map.origin();
+                    let (right, bottom) = map.far_corner();
+                    format!("ink area x {left:.0}..{right:.0} · y {top:.0}..{bottom:.0} pt")
+                }
+                None => "no ink area (the page has no room for the margin)".to_string(),
+            };
+            self.trace_line(format!(
+                "tablet: '{}' range {} x {} pressure {} · {area}",
+                spec.name, spec.max_x, spec.max_y, spec.max_pressure
+            ));
         }
         self.source = batch.source.clone();
         // A reason is a fact worth showing: "no range" is what stops the pen.
@@ -455,9 +781,73 @@ impl Shell {
         }
         self.samples += batch.samples.len() as u64;
         self.skipped += batch.stats.skipped;
+        self.stats.samples += batch.samples.len() as u64;
+        self.stats.skipped += batch.stats.skipped;
         for sample in &batch.samples {
+            self.observe(sample);
             self.pen(sample);
         }
+    }
+
+    /// Watches the raw stream: the **runs** of "the tip is down" and the gaps.
+    ///
+    /// This is the input half of the diagnosis, and it is deliberately separate
+    /// from [`Shell::pen`]: a short tip-down run *is* a dash on the page, and a
+    /// gap is a jump the pen never drew.  Both are facts about the stream, not
+    /// about the app's decisions — which is exactly what has to be told apart.
+    fn observe(&mut self, sample: &otd::Sample) {
+        let down = sample.touches() && !sample.out_of_range();
+        if self.seen_time != 0 {
+            let dt_ms = sample.time.saturating_sub(self.seen_time) as f32 / 10_000.0;
+            if dt_ms > TRACE_GAP_MS {
+                self.stats.gaps += 1;
+                self.stats.gap_worst_ms = self.stats.gap_worst_ms.max(dt_ms);
+                self.trace_line(format!(
+                    "gap: {dt_ms:.1} ms of stream missing before seq {} (flags 0x{:02x} p {:.0} \
+                     x {:.0} y {:.0}) · the run before it was {} reports long",
+                    sample.seq, sample.flags, sample.pressure, sample.x, sample.y, self.run_len
+                ));
+            }
+        }
+        match self.seen_down {
+            Some(previous) if previous == down => {
+                self.run_len += 1;
+                self.run_pressure.1 = sample.pressure;
+            }
+            Some(previous) => {
+                // A run just ended — this is the moment the app decides whether to
+                // end a stroke, so it gets one line.  The pressure range is the
+                // number that matters: a tip-down run whose pressure decays to ~0
+                // is a tablet that stopped reporting pressure, not a pen that was
+                // lifted (the tip flag is `pressure > 0` in the plugin).
+                self.trace_line(format!(
+                    "run: {} {} reports (p {:.0}..{:.0}, x {:.0}→{:.0} y {:.0}→{:.0}) → {} at seq {} \
+                     (flags 0x{:02x} p {:.0})",
+                    if previous { "tip-down" } else { "tip-up" },
+                    self.run_len,
+                    self.run_pressure.0,
+                    self.run_pressure.1,
+                    self.run_from.0,
+                    sample.x,
+                    self.run_from.1,
+                    sample.y,
+                    if down { "tip-down" } else { "tip-up" },
+                    sample.seq,
+                    sample.flags,
+                    sample.pressure
+                ));
+                self.run_len = 1;
+                self.run_pressure = (sample.pressure, sample.pressure);
+                self.run_from = (sample.x, sample.y);
+            }
+            None => {
+                self.run_len = 1;
+                self.run_pressure = (sample.pressure, sample.pressure);
+                self.run_from = (sample.x, sample.y);
+            }
+        }
+        self.seen_down = Some(down);
+        self.seen_time = sample.time;
     }
 
     /// One pen report → ink.  This is the hot path: O(1), no allocation after
@@ -483,6 +873,17 @@ impl Shell {
         };
 
         if stale && self.live.is_some() {
+            self.stats.stale += 1;
+            self.trace_line(format!(
+                "end: stale — {:.1} ms since the last report (seq {} flags 0x{:02x} p {:.3} \
+                 x {:.0} y {:.0})",
+                sample.time.saturating_sub(self.last_sample_time) as f32 / 10_000.0,
+                sample.seq,
+                sample.flags,
+                sample.pressure,
+                sample.x,
+                sample.y
+            ));
             self.commit_live();
         }
 
@@ -495,6 +896,24 @@ impl Shell {
                 self.ink(at, pressure, sample.time);
             }
         } else {
+            if self.live.is_some() {
+                // The two flags are worth separating: out-of-range means the pen
+                // left the tablet, a cleared tip means it was lifted (or that a
+                // hover report slipped into the stream).
+                if sample.out_of_range() {
+                    self.stats.out_of_range += 1;
+                    self.trace_line(format!(
+                        "end: out-of-range at seq {} (the pen left the tablet)",
+                        sample.seq
+                    ));
+                } else {
+                    self.stats.tip_up += 1;
+                    self.trace_line(format!(
+                        "end: tip up at seq {} (flags 0x{:02x} p {:.3} x {:.0} y {:.0})",
+                        sample.seq, sample.flags, sample.pressure, sample.x, sample.y
+                    ));
+                }
+            }
             self.commit_live();
         }
 
@@ -528,6 +947,14 @@ impl Shell {
         if let Some(stroke) = self.live.take()
             && !stroke.is_empty()
         {
+            let points = stroke.len();
+            let duration_ms = stroke.points().last().map(|point| point.time_ms).unwrap_or(0.0);
+            self.stats.commits += 1;
+            self.stats.points += points as u64;
+            self.trace_line(format!(
+                "commit: {points} points over {duration_ms:.1} ms (stroke {} on this page)",
+                self.document.page().strokes.len() + 1
+            ));
             self.document.add_stroke(stroke);
             self.invalidate();
         }
@@ -591,9 +1018,27 @@ impl Shell {
     /// happens only when WinUI reports that it has decoded (`Decoded`).
     fn baked(&mut self, baked: Baked) {
         self.bake_ms = baked.elapsed_ms;
+        self.stats.bakes += 1;
+        self.stats.bake_ms += baked.elapsed_ms;
         if baked.generation != self.generation {
+            // The page moved on while this bake was running: showing it would
+            // show ink that is already gone.
+            self.stats.bakes_dropped += 1;
+            self.trace_line(format!(
+                "bake: gen {} thrown away ({:.1} ms) — the page is already at gen {}",
+                baked.generation, baked.elapsed_ms, self.generation
+            ));
             return;
         }
+        self.stats.bakes_landed += 1;
+        self.trace_line(format!(
+            "bake: gen {} ready in {:.1} ms ({}x{} px, {} bytes of PNG)",
+            baked.generation,
+            baked.elapsed_ms,
+            baked.width,
+            baked.height,
+            baked.png.len()
+        ));
         self.baking = None;
         let slot = 1 - self.active;
         self.buffers[slot] = Buffer {
@@ -686,6 +1131,7 @@ impl Shell {
     /// What the elm screen asked for: the screen never edits the document, it
     /// asks, and this decides.
     fn intent(&mut self, intent: Intent) {
+        self.stats.intents += 1;
         match intent {
             Intent::Tool(tool) => {
                 self.tool = tool;
@@ -748,6 +1194,21 @@ impl Shell {
             }
             Intent::ToggleHelp => self.help = !self.help,
             Intent::ToggleDev => self.dev = !self.dev,
+            Intent::ToggleTrace => {
+                // The trace is per-run evidence, not a preference: flipping it
+                // starts a fresh section in the same file.
+                self.trace = !self.trace;
+                self.trace_events = 0;
+                if self.trace {
+                    self.trace_session();
+                    self.workers.log(format!(
+                        "trace: on — {}",
+                        crate::settings::Settings::debug_path().display()
+                    ));
+                } else {
+                    self.workers.log("trace: off".to_string());
+                }
+            }
             Intent::RescanTablet => {
                 self.rescan.store(true, Ordering::Relaxed);
                 self.status = "looking for the tablet again…".to_string();
@@ -975,14 +1436,30 @@ impl Shell {
             }
             None => "none yet".to_string(),
         };
+        // The render cadence, measured in `view`, next to the rate the ticker
+        // was asked for: when those two disagree, the loop is paced but the UI
+        // is not keeping up — which is what "it stutters" looks like as a number.
+        let views = self.view_calls.get();
+        let frame_gap_ms = self
+            .last_view
+            .get()
+            .map(|last| last.elapsed().as_secs_f32() * 1000.0)
+            .unwrap_or(0.0);
+        let view_cost_ms = if views == 0 {
+            0.0
+        } else {
+            self.view_ns.get() as f32 / views as f32 / 1_000_000.0
+        };
         format!(
             "loop {} Hz · display {} Hz · frames {}\n\
              ui busy {:.2} ms (worst {:.2} ms) · bake {:.1} ms · pdf render {:.1} ms\n\
+             views {} · view {:.2} ms (worst {:.2}) · last frame gap {:.1} ms · live shapes {}\n\
              pen samples {} · skipped by the ring {}\n\
              tablet: {}\n\
              ink area {} (tablet fitted into the page, aspect kept)\n\
              page {:.0}×{:.0} pt · scale {:.2} px/pt · margin {:.0} pt\n\
              strokes on this page {} · undo {} · redo {}\n\
+             trace {} · {}\n\
              pdf: {}",
             hz,
             self.detected_hz.max(60),
@@ -991,6 +1468,11 @@ impl Shell {
             self.worst_busy_ms,
             self.bake_ms,
             self.render_ms,
+            views,
+            view_cost_ms,
+            self.view_worst_ns.get() as f32 / 1_000_000.0,
+            frame_gap_ms,
+            self.live_pieces.get(),
             self.samples,
             self.skipped,
             self.source.summary(),
@@ -1002,6 +1484,8 @@ impl Shell {
             page.strokes.len(),
             self.document.can_undo(),
             self.document.can_redo(),
+            if self.trace { "on" } else { "off" },
+            crate::settings::Settings::debug_path().display(),
             match &self.pdf {
                 Some(pdf) => format!("{} page(s) open", pdf.pages.len()),
                 None => "none open".to_string(),

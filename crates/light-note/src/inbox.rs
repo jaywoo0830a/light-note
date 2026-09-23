@@ -20,6 +20,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// How long [`Inbox::wait_ready`] waits before re-checking its condition.
+///
+/// The condition cannot be missed (the check and the wait hold the same lock),
+/// so this is only a guard against a platform quirk: a waiter that never woke
+/// would leave the UI thread asleep with work queued, which is worse than a
+/// needless wakeup once in a while.
+const READY_GUARD: Duration = Duration::from_millis(250);
+
 /// A many-producer, one-consumer message queue.
 #[derive(Debug)]
 pub struct Inbox<T> {
@@ -77,6 +85,33 @@ impl<T> Inbox<T> {
             .wait_timeout(queue, timeout)
             .unwrap_or_else(|error| error.into_inner());
         queue.pop_front()
+    }
+
+    /// Waits until there is at least one message, **without taking it**.
+    ///
+    /// This is the background half of the pump: a worker parks here so the UI
+    /// thread is woken the moment something arrives.  It must not *consume* the
+    /// message — the UI thread drains it with [`Inbox::try_pop`], and a pump that
+    /// ate its own wakeup would silently drop one message per frame (a tick, or a
+    /// batch of pen samples).
+    ///
+    /// A missed notification cannot be lost: the emptiness check and the wait
+    /// happen while the lock is held, so a `push` can only happen either before
+    /// the check (the queue is not empty, so there is no wait) or after the wait
+    /// has begun (the condvar wakes it).  The timeout is a belt-and-braces guard,
+    /// and the loop re-checks the condition.
+    pub fn wait_ready(&self) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while queue.is_empty() {
+            let (next, _) = self
+                .ready
+                .wait_timeout(queue, READY_GUARD)
+                .unwrap_or_else(|error| error.into_inner());
+            queue = next;
+        }
     }
 
     /// Waits until a message arrives.

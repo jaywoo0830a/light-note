@@ -63,6 +63,8 @@ pub enum Intent {
     ToggleHelp,
     /// Show/hide the input + frame diagnostics.
     ToggleDev,
+    /// Turn the debug trace (see `Settings::debug_path`) on or off.
+    ToggleTrace,
     /// Re-scan for the OTD plugin (the daemon may have started later).
     RescanTablet,
     /// Quit.

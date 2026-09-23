@@ -88,6 +88,9 @@ pub struct Workers {
     dialogs: Sender<DialogJob>,
     /// Used to retarget the ticker when the refresh rate changes.
     ticker: Sender<u32>,
+    /// Debug trace lines: the file is owned by the log worker, never by the UI
+    /// thread (rule R1 — the UI thread opens nothing, not even a log).
+    log: Sender<String>,
 }
 
 impl Workers {
@@ -97,6 +100,7 @@ impl Workers {
         let (pdf_tx, pdf_rx) = channel::<PdfJob>();
         let (dialog_tx, dialog_rx) = channel::<DialogJob>();
         let (tick_tx, tick_rx) = channel::<u32>();
+        let (log_tx, log_rx) = channel::<String>();
 
         spawn("light-note-bake", {
             let inbox = Arc::clone(&ui_inbox);
@@ -112,14 +116,17 @@ impl Workers {
         });
         spawn("light-note-ticker", {
             let inbox = Arc::clone(&ui_inbox);
-            move || ticker_worker(tick_rx, refresh_hz, inbox)
+            let log = log_tx.clone();
+            move || ticker_worker(tick_rx, refresh_hz, inbox, log)
         });
+        spawn("light-note-log", move || log_worker(log_rx));
 
         Self {
             bake: bake_tx,
             pdf: pdf_tx,
             dialogs: dialog_tx,
             ticker: tick_tx,
+            log: log_tx,
         }
     }
 
@@ -139,6 +146,11 @@ impl Workers {
     /// Changes the frame rate (60/120/180/240).
     pub fn set_refresh(&self, hz: u32) {
         let _ = self.ticker.send(hz);
+    }
+
+    /// Queues one debug line.  Never waits: the log worker owns the file.
+    pub fn log(&self, line: String) {
+        let _ = self.log.send(line);
     }
 }
 
@@ -283,17 +295,94 @@ fn dialog_worker(jobs: Receiver<DialogJob>, inbox: Arc<Inbox<HostMessage>>) {
     }
 }
 
+/// Writes the debug trace to `%APPDATA%\light-note\debug.log`.
+///
+/// The file is opened (and truncated) here, on this thread, so the UI thread
+/// never touches a file handle — the same rule every other worker follows.  It
+/// is flushed whenever the queue drains, so the log can be pasted while the app
+/// is still running.
+fn log_worker(lines: Receiver<String>) {
+    let path = crate::settings::Settings::debug_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::File::create(&path) else {
+        return; // a log that cannot be written must not be a reason to fail
+    };
+    let mut file = std::io::BufWriter::new(file);
+    use std::io::Write;
+    let _ = writeln!(
+        file,
+        "=== light-note debug log · {} ===\nthreads: ui · otd-reader · bake · pdf · dialogs · ticker · log",
+        path.display()
+    );
+    let _ = file.flush();
+    loop {
+        // A short wait after the queue goes quiet is when the buffer is flushed:
+        // a line that is still buffered is a line the user cannot paste, and a
+        // flush per line would be a syscall per pen sample.
+        match lines.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                if writeln!(file, "{line}").is_err() {
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = file.flush();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = file.flush();
+}
+
 /// The frame ticker: the app's heartbeat at the display's rate.
 ///
 /// It exists so the loop keeps running even when nothing else happens (a note
 /// with no pen input still has to show its frame rate), and so a refresh-rate
 /// change takes effect without restarting anything.
-fn ticker_worker(rates: Receiver<u32>, refresh_hz: u32, inbox: Arc<Inbox<HostMessage>>) {
+///
+/// It reports its own numbers once a second, because "the loop is at 180 Hz" is a
+/// claim: what matters is how many ticks actually left this thread, how long the
+/// wait really took, and how deep the inbox was when they arrived.
+fn ticker_worker(
+    rates: Receiver<u32>,
+    refresh_hz: u32,
+    inbox: Arc<Inbox<HostMessage>>,
+    log: Sender<String>,
+) {
     let mut clock = FrameClock::new(refresh_hz);
+    let mut pushed = 0u32;
+    let mut slept_ms = 0.0f32;
+    let mut worst_ms = 0.0f32;
+    let mut since = Instant::now();
     loop {
         let deadline = clock.next();
+        let before = Instant::now();
         clock.wait_until(deadline);
+        let waited = before.elapsed().as_secs_f32() * 1000.0;
+        slept_ms += waited;
+        worst_ms = worst_ms.max(waited);
         inbox.push(HostMessage::Tick);
+        pushed += 1;
+
+        let elapsed = since.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            let seconds = elapsed.as_secs_f32();
+            let _ = log.send(format!(
+                "ticker: pushed {:.0}/s · waited {:.2} ms/report (worst {:.1}) · asked {:.2} ms · \
+                 inbox depth {}",
+                pushed as f32 / seconds,
+                if pushed == 0 { 0.0 } else { slept_ms / pushed as f32 },
+                worst_ms,
+                clock.period().as_secs_f32() * 1000.0,
+                inbox.len(),
+            ));
+            pushed = 0;
+            slept_ms = 0.0;
+            worst_ms = 0.0;
+            since = Instant::now();
+        }
 
         // A rate change arrives on this channel; `try_recv` keeps the frame
         // cadence intact (no blocking wait in the loop).
