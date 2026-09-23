@@ -12,7 +12,7 @@
 //! ([`super::reader`]), never the reader loop — a stuck pipe there would stop the
 //! pen itself, which is exactly the kind of dependency this app is built to avoid.
 
-use crate::otd::map::TabletSpec;
+use crate::otd::spec::TabletSpec;
 use crate::otd::tablets::{self, Framer, ID};
 
 /// The daemon's pipe name (measured on OTD 0.6.7).

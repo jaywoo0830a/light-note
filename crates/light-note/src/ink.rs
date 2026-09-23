@@ -10,7 +10,10 @@
 //!   pressure is noisy and an unsmoothed line looks furry;
 //! * **samples are decimated** — points closer than 0.4 pt are dropped *unless*
 //!   the pressure moved, which keeps the model small without flattening the
-//!   line's dynamics.
+//!   line's dynamics;
+//! * **tilt and the barrel's rotation shape the nib** — a pen lying flat leaves
+//!   a wider mark, and a flat nib turned by the barrel draws a thin line along
+//!   its axis and a thick one across it ([`Nib`]).
 //!
 //! Everything here is a plain value: `Send`, no platform type, no lock.
 
@@ -34,6 +37,14 @@ pub const MIN_PRESSURE_DELTA: f32 = 0.02;
 pub const MIN_SPEED_PRESSURE: f32 = 0.15;
 /// Speed (pt/ms) at which speed-derived pressure bottoms out.
 pub const SPEED_FOR_MIN_PRESSURE: f32 = 2.5;
+/// How much wider a fully tilted (flat) nib draws: a pen lying down leaves
+/// `1 + TILT_WIDTH_GAIN` times the nib's width.
+///
+/// `f64` for the same reason as [`MIN_WIDTH_RATIO`]: the geometry layer is
+/// `f64`, and the ratio is multiplied before anything is rounded.
+pub const TILT_WIDTH_GAIN: f64 = 0.6;
+/// Tilt (deg) at which the nib counts as fully flat.
+pub const MAX_TILT_DEG: f32 = 90.0;
 
 /// What the pen is doing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -137,29 +148,169 @@ impl Style {
     }
 }
 
+/// How the pen is held: tilt (deg, as the tablet reports it) and the barrel's
+/// rotation (deg).  Both are zero when the hardware does not report them, which
+/// is why [`Nib::default`] means "a pen held upright".
+///
+/// The two effects this produces:
+///
+/// * **a flat nib draws wider** — the mark grows up to [`TILT_WIDTH_GAIN`] with
+///   the tilt, so pressure is not the only thing that changes the line's weight;
+/// * **the direction matters** — a flat nib's edge lies along the lean
+///   direction (turned by the barrel's rotation), so a stroke across that axis
+///   is thick and a stroke along it is thin, like a chisel-tip marker
+///   ([`Nib::width_ratio`]).
+///
+/// The angle in the stream is the lean, so `atan2` never fails; only the
+/// *magnitude* is used when the direction is unknown (a dot).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Nib {
+    /// Tilt towards +x, degrees (0 = upright).
+    pub tilt_x: f32,
+    /// Tilt towards +y, degrees.
+    pub tilt_y: f32,
+    /// Barrel rotation, degrees (0 = untouched).
+    pub rotation: f32,
+}
+
+impl Nib {
+    /// A pen held straight up: a round nib, no direction.
+    pub const UPRIGHT: Self = Self {
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+    };
+
+    /// A nib from the three numbers a tablet reports.
+    pub const fn new(tilt_x: f32, tilt_y: f32, rotation: f32) -> Self {
+        Self {
+            tilt_x,
+            tilt_y,
+            rotation,
+        }
+    }
+
+    /// Is the pen upright (no tilt worth applying)?
+    pub fn is_upright(&self) -> bool {
+        self.flatness() <= 0.0
+    }
+
+    /// `0` for an upright pen, `1` for one lying flat on the tablet.
+    ///
+    /// A tablet that reports a wild tilt (or `NaN`) is clamped, never trusted:
+    /// the width it produces has to stay finite.
+    pub fn flatness(&self) -> f32 {
+        let magnitude = (self.tilt_x * self.tilt_x + self.tilt_y * self.tilt_y).sqrt();
+        if !magnitude.is_finite() {
+            return 0.0;
+        }
+        (magnitude / MAX_TILT_DEG).clamp(0.0, 1.0)
+    }
+
+    /// The angle (radians) the nib's flat edge lies along.
+    ///
+    /// The lean gives the direction the nib points *down* to; the barrel's
+    /// rotation turns that edge.  `None` for an upright pen, whose nib is round
+    /// and therefore has no axis.
+    ///
+    /// The ratio built from this axis uses `|sin|`, so it is π-periodic: a nib
+    /// rotated by half a turn is the same nib, which is exactly how a symmetric
+    /// flat nib behaves.
+    pub fn axis(&self) -> Option<f32> {
+        if self.is_upright() {
+            return None;
+        }
+        Some(self.tilt_y.atan2(self.tilt_x) + self.rotation.to_radians())
+    }
+
+    /// How much wider than the upright nib the mark is for a stroke heading in
+    /// `direction` (radians, page axes; `None` = the heading is unknown).
+    ///
+    /// `|sin|` of the angle between the nib's edge and the heading: 1 across the
+    /// edge (widest), 0 along it (only the nib's thickness).  With no heading
+    /// the widest value is used, which is what a dot and a bounding box need.
+    pub fn width_ratio(&self, direction: Option<f32>) -> f64 {
+        let flatness = self.flatness() as f64;
+        if flatness <= 0.0 {
+            return 1.0;
+        }
+        let Some(axis) = self.axis() else {
+            return 1.0;
+        };
+        let alignment = match direction {
+            Some(direction) => (direction - axis).sin().abs() as f64,
+            None => 1.0,
+        };
+        1.0 + TILT_WIDTH_GAIN * flatness * alignment
+    }
+}
+
 /// One sample of a stroke.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct InkPoint {
     /// Position on the page (pt, top-left origin).
     pub pos: Pt,
-    /// Pressure in `0..=1` (already normalized by the mapping).
+    /// Pressure in `0..=1` (already normalized by the tablet spec).
     pub pressure: f32,
+    /// How the pen was held when this sample was taken.
+    pub nib: Nib,
     /// Time since the stroke started (ms) — used to derive speed.
     pub time_ms: f64,
 }
 
-/// The width a stroke of `style` has at `pressure`, in pt.
+impl InkPoint {
+    /// An upright-pen sample.
+    pub const fn new(pos: Pt, pressure: f32, time_ms: f64) -> Self {
+        Self {
+            pos,
+            pressure,
+            nib: Nib::UPRIGHT,
+            time_ms,
+        }
+    }
+
+    /// A sample from a pen held at an angle.
+    pub const fn with_nib(pos: Pt, pressure: f32, nib: Nib, time_ms: f64) -> Self {
+        Self {
+            pos,
+            pressure,
+            nib,
+            time_ms,
+        }
+    }
+}
+
+/// The width a stroke of `style` has at `pressure` with the nib `nib`, in pt.
+///
+/// `direction` is the heading of the stroke where this width is used (radians);
+/// `None` means "unknown", and then a tilted nib contributes its **widest**
+/// footprint — the value a dot, a bounding box and a hit test all need.
 ///
 /// The ratio is computed in `f64` and rounded once at the end.  The same
 /// expression in `f32` gives 1.3499999 for a 2 pt nib at half pressure (because
 /// `0.35f32` and `0.65f32` are both a little low), and the geometry layer —
 /// which is `f64` — would carry that error into every span width.
-pub fn width_at(style: &Style, pressure: f32) -> f64 {
+pub fn width_at(style: &Style, pressure: f32, nib: Nib, direction: Option<f32>) -> f64 {
     if style.tool == Tool::Highlighter {
+        // A highlighter is a felt marker: pressure and tilt do not change its
+        // line, only the tool's width does.
         return style.width_pt as f64;
     }
     let ratio = MIN_WIDTH_RATIO + (1.0 - MIN_WIDTH_RATIO) * clamp01(pressure) as f64;
-    style.width_pt as f64 * ratio
+    style.width_pt as f64 * ratio * nib.width_ratio(direction)
+}
+
+/// The heading (radians) from one sample to the next, or `None` when the pen did
+/// not move (a dot has no direction, so a tilted nib keeps its widest mark).
+pub fn heading(from: Pt, to: Pt) -> Option<f32> {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    if dx == 0.0 && dy == 0.0 {
+        None
+    } else {
+        Some(dy.atan2(dx))
+    }
 }
 
 /// Pressure derived from speed (pt/ms) for tablets that report none.
@@ -237,10 +388,13 @@ impl Stroke {
     }
 
     /// The area the stroke covers, nib width included.
+    ///
+    /// A tilted nib is measured with its widest footprint (`None` heading), so
+    /// the box never under-covers the ink it is asked to describe.
     pub fn bounds(&self) -> Rect {
         let mut rect = Rect::default();
         for point in &self.points {
-            let half = (width_at(&self.style, point.pressure) * 0.5) as f32;
+            let half = (width_at(&self.style, point.pressure, point.nib, None) * 0.5) as f32;
             rect = rect.union(Rect::new(
                 point.pos.x - half,
                 point.pos.y - half,
@@ -254,19 +408,22 @@ impl Stroke {
     /// Is `point` within `radius` of the stroke's centerline?
     ///
     /// This is the eraser's hit test, and it is why the nib erases what the eye
-    /// thinks it touched: the stroke's own width counts, not just its path.
+    /// thinks it touched: the stroke's own width counts, not just its path.  The
+    /// widest footprint is used, so a flat nib erases as much as it can touch.
     pub fn touches(&self, point: Pt, radius: f32) -> bool {
         let points = &self.points;
         if points.is_empty() {
             return false;
         }
         if points.len() == 1 {
-            let half = (width_at(&self.style, points[0].pressure) * 0.5) as f32;
+            let half = (width_at(&self.style, points[0].pressure, points[0].nib, None) * 0.5) as f32;
             return points[0].pos.distance_to(point) <= radius + half;
         }
         points.windows(2).any(|pair| {
+            let nib = pair[0].nib;
             let half =
-                (width_at(&self.style, (pair[0].pressure + pair[1].pressure) * 0.5) * 0.5) as f32;
+                (width_at(&self.style, (pair[0].pressure + pair[1].pressure) * 0.5, nib, None) * 0.5)
+                    as f32;
             distance_to_segment(point, pair[0].pos, pair[1].pos) <= radius + half
         })
     }

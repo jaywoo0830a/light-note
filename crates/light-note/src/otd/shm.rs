@@ -17,7 +17,7 @@
 //! This module is pure: bytes in, values out.  The mapping and the thread that
 //! polls it are Windows-only and live in [`super::reader`].
 
-use super::map::TabletSpec;
+use super::spec::TabletSpec;
 
 /// The mapping name the plugin creates (in the session namespace).
 pub const MAP_NAME: &str = "light-note.otd.shm";
@@ -104,7 +104,9 @@ impl Header {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
     pub seq: u64,
-    /// Tablet X in device units (**not** converted — the app maps it).
+    /// Tablet X in device units — the pen's position *on the tablet*, which the
+    /// app does not use for placement (the canvas's pointer event says where the
+    /// pen is on the page).
     pub x: f32,
     pub y: f32,
     /// Raw pressure in device units (`0` = not touching).

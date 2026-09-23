@@ -19,6 +19,13 @@ use light_note::ink::{
     keep_sample, pressure_from_speed, smooth_pressure, width_at,
 };
 
+/// The nib a plain pressure test uses: upright (no tilt, no rotation) and a
+/// heading nobody knows — which is the one case where the width is exactly the
+/// pressure formula.
+fn width(style: &Style, pressure: f32) -> f64 {
+    width_at(style, pressure, light_note::ink::Nib::UPRIGHT, None)
+}
+
 #[test]
 fn tools_that_write_ink_are_pen_and_highlighter() {
     assert!(Tool::Pen.writes_ink());
@@ -38,18 +45,18 @@ fn pen_width_scales_with_pressure_from_a_visible_floor() {
     let style = support::pen(2.0);
 
     assert_eq!(MIN_WIDTH_RATIO, 0.35);
-    assert_eq!(width_at(&style, 0.0), 0.7, "no pressure is still visible");
-    assert_eq!(width_at(&style, 1.0), 2.0, "full pressure is the full width");
-    assert_eq!(width_at(&style, 0.5), 2.0 * 0.675);
+    assert_eq!(width(&style, 0.0), 0.7, "no pressure is still visible");
+    assert_eq!(width(&style, 1.0), 2.0, "full pressure is the full width");
+    assert_eq!(width(&style, 0.5), 2.0 * 0.675);
 }
 
 #[test]
 fn width_clamps_out_of_range_pressure() {
     let style = support::pen(2.0);
 
-    assert_eq!(width_at(&style, -1.0), width_at(&style, 0.0));
-    assert_eq!(width_at(&style, 4.0), width_at(&style, 1.0));
-    assert_eq!(width_at(&style, f32::NAN), width_at(&style, 0.0));
+    assert_eq!(width(&style, -1.0), width(&style, 0.0));
+    assert_eq!(width(&style, 4.0), width(&style, 1.0));
+    assert_eq!(width(&style, f32::NAN), width(&style, 0.0));
 }
 
 #[test]
@@ -58,9 +65,9 @@ fn highlighter_keeps_a_constant_width() {
     // sensitive.  Pressure is still recorded, it just does not change width.
     let style = support::highlighter(14.0);
 
-    assert_eq!(width_at(&style, 0.0), 14.0);
-    assert_eq!(width_at(&style, 0.5), 14.0);
-    assert_eq!(width_at(&style, 1.0), 14.0);
+    assert_eq!(width(&style, 0.0), 14.0);
+    assert_eq!(width(&style, 0.5), 14.0);
+    assert_eq!(width(&style, 1.0), 14.0);
 }
 
 #[test]
@@ -86,23 +93,11 @@ fn pressure_smoothing_moves_a_fraction_of_the_way() {
 fn samples_closer_than_the_minimum_distance_are_dropped() {
     assert_eq!(MIN_SAMPLE_DISTANCE_PT, 0.4);
 
-    let last = InkPoint {
-        pos: Pt::new(10.0, 10.0),
-        pressure: 0.5,
-        time_ms: 0.0,
-    };
-    let too_close = InkPoint {
-        pos: Pt::new(10.2, 10.0),
-        pressure: 0.5,
-        time_ms: 2.5,
-    };
+    let last = InkPoint::new(Pt::new(10.0, 10.0), 0.5, 0.0);
+    let too_close = InkPoint::new(Pt::new(10.2, 10.0), 0.5, 2.5);
     assert!(!keep_sample(&last, &too_close), "0.2 pt is below the floor");
 
-    let far_enough = InkPoint {
-        pos: Pt::new(10.5, 10.0),
-        pressure: 0.5,
-        time_ms: 5.0,
-    };
+    let far_enough = InkPoint::new(Pt::new(10.5, 10.0), 0.5, 5.0);
     assert!(keep_sample(&last, &far_enough));
 }
 
@@ -110,24 +105,12 @@ fn samples_closer_than_the_minimum_distance_are_dropped() {
 fn a_pressure_change_survives_the_distance_filter() {
     // "Close but different pressure" is exactly the sample that makes a stroke
     // look alive, so it is kept even though it sits near the previous point.
-    let last = InkPoint {
-        pos: Pt::new(10.0, 10.0),
-        pressure: 0.2,
-        time_ms: 0.0,
-    };
-    let same_place_new_pressure = InkPoint {
-        pos: Pt::new(10.1, 10.0),
-        pressure: 0.6,
-        time_ms: 2.5,
-    };
+    let last = InkPoint::new(Pt::new(10.0, 10.0), 0.2, 0.0);
+    let same_place_new_pressure = InkPoint::new(Pt::new(10.1, 10.0), 0.6, 2.5);
     assert!(keep_sample(&last, &same_place_new_pressure));
 
     // A tiny pressure wobble (below the delta) is still dropped.
-    let wobble = InkPoint {
-        pos: Pt::new(10.1, 10.0),
-        pressure: 0.205,
-        time_ms: 2.5,
-    };
+    let wobble = InkPoint::new(Pt::new(10.1, 10.0), 0.205, 2.5);
     assert!(!keep_sample(&last, &wobble));
 }
 
@@ -138,19 +121,11 @@ fn a_stroke_keeps_its_first_sample_no_matter_what() {
     assert!(stroke.is_empty());
     assert_eq!(stroke.len(), 0);
 
-    stroke.push(InkPoint {
-        pos: Pt::new(5.0, 5.0),
-        pressure: 0.0,
-        time_ms: 0.0,
-    });
+    stroke.push(InkPoint::new(Pt::new(5.0, 5.0), 0.0, 0.0));
     assert_eq!(stroke.len(), 1);
 
     // The same position and pressure again: dropped — a tap must stay a dot.
-    stroke.push(InkPoint {
-        pos: Pt::new(5.0, 5.0),
-        pressure: 0.0,
-        time_ms: 2.5,
-    });
+    stroke.push(InkPoint::new(Pt::new(5.0, 5.0), 0.0, 2.5));
     assert_eq!(stroke.len(), 1);
 }
 

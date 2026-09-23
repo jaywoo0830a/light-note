@@ -30,8 +30,6 @@ pub struct Settings {
     pub highlighter_width_pt: f32,
     /// Eraser radius in pt.
     pub eraser_radius_pt: f32,
-    /// Margin between the tablet's ink area and the page edge, in pt.
-    pub margin_pt: f32,
     /// Show the input/frame diagnostics panel.
     pub show_dev_panel: bool,
 }
@@ -44,7 +42,6 @@ impl Default for Settings {
             pen_width_pt: Tool::Pen.default_width_pt(),
             highlighter_width_pt: Tool::Highlighter.default_width_pt(),
             eraser_radius_pt: Tool::Eraser.default_width_pt(),
-            margin_pt: 24.0,
             show_dev_panel: false,
         }
     }
@@ -140,7 +137,6 @@ impl Settings {
         self.pen_width_pt = clamp(self.pen_width_pt, 0.5, 40.0, 2.0);
         self.highlighter_width_pt = clamp(self.highlighter_width_pt, 1.0, 80.0, 14.0);
         self.eraser_radius_pt = clamp(self.eraser_radius_pt, 1.0, 120.0, 12.0);
-        self.margin_pt = clamp(self.margin_pt, 0.0, 200.0, 24.0);
     }
 
     /// The nib width of `tool` according to these settings.

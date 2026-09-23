@@ -10,7 +10,7 @@
 mod support;
 
 use light_note::geom::{Scale, Size};
-use light_note::ink::Tool;
+use light_note::ink::{MAX_TILT_DEG, Nib, Tool};
 use light_note::shape::{
     FLATTEN_TOLERANCE_PX, LivePiece, StrokeShape, from_png, ink_coverage, live_pieces, pixel_at,
     rasterize, spans_union, stroke_shape, to_png,
@@ -201,3 +201,30 @@ fn a_background_bitmap_is_composited_under_the_ink() {
     assert!(pixel_at(&pixmap, 75, 75).a > 200);
     assert!(pixel_at(&pixmap, 75, 75).r < 120, "ink covers the page");
 }
+
+#[test]
+fn a_tilted_nib_draws_a_chisel_edge() {
+    // One grip, two directions: with the nib's edge along x, a stroke along x is
+    // thin and a stroke along y is thick.  Both consumers read this same shape, so
+    // the bitmap and the live lines cannot disagree about it.
+    let nib = Nib::new(MAX_TILT_DEG, 0.0, 0.0);
+    let style = support::pen(4.0);
+    let width_of = |points: &[(f32, f32, f32)]| {
+        let stroke = support::stroke_with_nib(style, nib, points);
+        let shape = stroke_shape(&stroke, SCALE).expect("shape");
+        shape.spans().expect("spans")[0].width
+    };
+
+    // 4 pt * 1.5 px/pt along the edge, 4 pt * (1 + 0.6) across it.
+    assert!((width_of(&[(0.0, 0.0, 1.0), (20.0, 0.0, 1.0)]) - 6.0).abs() < 1e-5);
+    assert!((width_of(&[(0.0, 0.0, 1.0), (0.0, 20.0, 1.0)]) - 9.6).abs() < 1e-5);
+
+    // The same stroke with an upright pen has one width in both directions: the
+    // tilt is what made a difference, not the direction itself.
+    let upright = support::line(support::pen(4.0), 0.0, 20.0, 0.0, 1.0);
+    match stroke_shape(&upright, SCALE).expect("shape") {
+        StrokeShape::Curve { width, .. } => assert!((width - 6.0).abs() < 1e-5),
+        other => panic!("an upright pen keeps one width, got {other:?}"),
+    }
+}
+

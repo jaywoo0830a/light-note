@@ -1,11 +1,22 @@
 //! The host: the only place that knows about all four stages.
 //!
 //! ```text
-//! HostMessage::Tablet(batch) → pen samples → Document (+ live stroke) → view
+//! HostMessage::Pointer(..)   → where the pen is on the page → live stroke → view
+//! HostMessage::Tablet(batch) → the pen's attributes (pressure, tilt, rotation)
 //! HostMessage::Baked(png)    → inactive buffer → (Decoded) → active buffer
 //! HostMessage::Intent(..)    → document / tool / zoom / export requests
 //! HostMessage::Tick          → frame meters, then re-arm the pump
 //! ```
+//!
+//! ## Why the input is split in two
+//!
+//! The **position** comes from the canvas's own pointer event: that is the point
+//! on the screen the pen is touching, so the ink lands under the nib whatever the
+//! window size, the zoom or the page's aspect ratio.  The **attributes** —
+//! pressure, tilt, barrel rotation, the eraser flag — come from OTD's shared
+//! memory, because a WinUI pointer event does not carry them.  Each pointer
+//! sample is drawn with the newest attribute report, which is what makes a pen
+//! with only a mouse-level pointer still feel like a pen.
 //!
 //! ## What this thread never does
 //!
@@ -33,15 +44,15 @@ use windows_reactor::{
 };
 
 use super::screen::{Screen, ScreenProps};
-use super::surface::{self, Buffer};
+use super::surface::{self, Buffer, MOUSE_PRESSURE};
 use super::workers::{BakeRequest, Baked, DialogJob, PdfJob, Workers};
 use super::{HostMessage, Intent, OpenedPdf, PointerPhase, Purpose, ViewModel};
 use crate::display::{FpsMeter, RefreshChoice, frame_period};
 use crate::doc::Document;
 use crate::geom::{Pt, Scale, Size};
 use crate::inbox::Inbox;
-use crate::ink::{InkPoint, Stroke, Style, Tool, pressure_from_speed, smooth_pressure};
-use crate::otd::{self, Batch, PageMap, STALE_GAP_TICKS, Source, TabletSpec};
+use crate::ink::{InkPoint, Nib, Stroke, Style, Tool, pressure_from_speed, smooth_pressure};
+use crate::otd::{self, ATTRIBUTE_FRESH_MS, Batch, PenState, Source, TabletSpec};
 use crate::pdf::PageInk;
 use crate::settings::Settings;
 
@@ -63,17 +74,21 @@ const DECODE_GRACE: Duration = Duration::from_millis(50);
 /// leaves a little empty desk, too little would push the toolbar off the window.
 const SCREEN_HEIGHT: f64 = 360.0;
 
+/// The pressure at which the trace calls a report "the tip is down".
+///
+/// A hovering pen still reports a few counts of pressure, so the tablet's own
+/// tip flag (which the plugin sets from `pressure > 0`) flickers while the pen is
+/// in the air.  The flag decides nothing here — WinUI's pointer press decides
+/// whether ink is written — so the trace only needs the moment the pen is really
+/// pressed.
+const TIP_DOWN_TRACE_PRESSURE: f32 = 0.05;
+
 /// The desk's padding around the sheet.
 const DESK_PADDING: f64 = 12.0;
 
 /// How many event lines the trace writes before it stops (the once-a-second
 /// summary keeps going, so the shape of a long session is never lost).
 const TRACE_EVENT_CAP: u32 = 6000;
-
-/// A gap between two pen reports that means "the stream stopped, not the pen".
-/// The same 20 ms the trace calls a gap — below it, a 250 Hz tablet simply
-/// missed a report or two.
-const TRACE_GAP_MS: f32 = 20.0;
 
 /// One second of counters: what the app did, and what it cost.
 ///
@@ -90,17 +105,20 @@ struct Stats {
     ticks: u64,
     batches: u64,
     intents: u64,
-    /// Pen samples applied, and the strokes they turned into.
-    samples: u64,
+    /// Pointer messages the canvas delivered (every phase), and the samples that
+    /// actually drew: the pair is what says whether WinUI sees the pen at all.
+    pointer_messages: u64,
+    /// Pointer samples drawn, and the strokes they turned into.
+    pointers: u64,
     commits: u64,
     points: u64,
-    /// Why a stroke ended: a stale gap / the tip flag / out-of-range.
-    stale: u64,
-    tip_up: u64,
-    out_of_range: u64,
-    /// Reports whose timestamp jumped more than [`TRACE_GAP_MS`].
-    gaps: u64,
-    gap_worst_ms: f32,
+    /// Attribute reports applied, and how old the newest one was when a pointer
+    /// sample was drawn with it (the latency of the pressure/tilt path).
+    reports: u64,
+    attribute_age_ms: f32,
+    attribute_age_worst_ms: f32,
+    /// Pointer samples drawn without a fresh report (a mouse, or OTD stopped).
+    stale_attributes: u64,
     /// Samples the reader never saw (the ring overflowed).
     skipped: u64,
     /// Bake pipeline: asked, finished, and thrown away as stale.
@@ -137,6 +155,20 @@ impl Stats {
     }
 }
 
+/// What one pointer sample is drawn with: the pen's attributes as the newest
+/// report described them, or the fallback for a plain mouse.
+#[derive(Clone, Copy, Debug)]
+struct PenInput {
+    /// Pressure in `0..=1` (smoothed, or derived from speed).
+    pressure: f32,
+    nib: Nib,
+    /// Is the eraser end down?
+    eraser: bool,
+    /// Did these come from a report that is still fresh?  A stale one draws with
+    /// the fallback and is counted in the trace.
+    fresh: bool,
+}
+
 /// The host component.
 pub struct Shell {
     inbox: Arc<Inbox<HostMessage>>,
@@ -150,17 +182,29 @@ pub struct Shell {
     zoom: f32,
 
     // ── input ──────────────────────────────────────────────────────────────
-    map: Option<PageMap>,
+    /// The pen's attributes as of the newest OTD report (pressure, tilt,
+    /// rotation, the eraser flag — never the position).
+    pen: PenState,
+    /// When that report reached this thread: the age is what the diagnostics
+    /// report, and what decides whether the attributes are still the pen's.
+    pen_at: Option<Instant>,
     tablet: Option<TabletSpec>,
     source: Source,
     live: Option<Stroke>,
     erasing: bool,
+    /// The smoothed pressure the newest reports describe.
     pressure: f32,
-    last_sample_time: u64,
+    /// `Instant`-based ticks (QPC, 100 ns) for the pointer samples, and where the
+    /// previous one was — speed-derived pressure needs both.
+    last_pointer_ticks: u64,
     last_pos: Pt,
     stroke_start: u64,
     rescan: Arc<AtomicBool>,
-    samples: u64,
+    /// Session totals: pointer messages seen, samples drawn, attribute reports
+    /// applied, and samples the reader never saw.
+    pointer_messages: u64,
+    pointers: u64,
+    reports: u64,
     skipped: u64,
 
     // ── trace ──────────────────────────────────────────────────────────────
@@ -168,15 +212,6 @@ pub struct Shell {
     trace: bool,
     /// Event lines written since the trace started (capped, see [`TRACE_EVENT_CAP`]).
     trace_events: u32,
-    /// The previous report's timestamp and whether the tip was down — the two
-    /// values that turn a stream into "a stroke" or "dashes".
-    seen_time: u64,
-    seen_down: Option<bool>,
-    /// How long the current tip-down / tip-up run has been going (reports), and
-    /// what it looked like: the first/last pressure and where it started.
-    run_len: u32,
-    run_pressure: (f32, f32),
-    run_from: (f32, f32),
     /// One second of counters, and when that second started.
     stats: Stats,
     stats_since: Instant,
@@ -247,7 +282,6 @@ impl Component for Shell {
 
         let document = Document::blank(A4);
         let tool = settings.tool;
-        let margin = settings.margin_pt;
         let mut shell = Self {
             inbox,
             workers,
@@ -256,25 +290,24 @@ impl Component for Shell {
             tool,
             scale: Scale::DEFAULT,
             zoom: 100.0,
-            map: None,
+            pen: PenState::default(),
+            pen_at: None,
             tablet: None,
             source: Source::NoPlugin("starting".to_string()),
             live: None,
             erasing: false,
-            pressure: 0.0,
-            last_sample_time: 0,
+            // A mouse reports half; a pen's own pressure arrives from OTD.
+            pressure: MOUSE_PRESSURE,
+            last_pointer_ticks: 0,
             last_pos: Pt::new(0.0, 0.0),
             stroke_start: 0,
             rescan,
-            samples: 0,
+            pointer_messages: 0,
+            pointers: 0,
+            reports: 0,
             skipped: 0,
             trace: true,
             trace_events: 0,
-            seen_time: 0,
-            seen_down: None,
-            run_len: 0,
-            run_pressure: (0.0, 0.0),
-            run_from: (0.0, 0.0),
             stats: Stats::default(),
             stats_since: Instant::now(),
             view_calls: Cell::new(0),
@@ -302,9 +335,9 @@ impl Component for Shell {
             render_ms: 0.0,
             frame_count: 0,
             status: format!("{} Hz display · {} Hz loop", detected_hz.max(60), hz),
-            hint: "A digitizer writes through OTD; the mouse writes only while no tablet \
-                   is running. Shortcuts live on the buttons, and the tablet's eraser end \
-                   erases."
+            hint: "The pen's position comes from the canvas, so the ink lands under the nib; \
+                   pressure, tilt and rotation come from OTD's shared memory. Shortcuts live on \
+                   the buttons, and the tablet's eraser end erases."
                 .to_string(),
             help: false,
             dev: false,
@@ -319,7 +352,6 @@ impl Component for Shell {
         // The header of the debug log: everything needed to read the numbers
         // below it (the tablet's range arrives later, and is logged then).
         shell.trace_session();
-        let _ = margin;
         shell
     }
 
@@ -360,19 +392,15 @@ impl Component for Shell {
                 let _ = sender.send(HostMessage::Decoded(slot));
             })
         };
-        // The mouse (or a pen that WinUI sees but OTD does not): the fallback path.
+        // The canvas's own pointer: the position every sample is drawn at.  The
+        // pressure and the tilt are looked up in the newest OTD report instead
+        // (see `Shell::pointer`), because a WinUI pointer event does not carry
+        // them.
         let on_pointer = {
             let sender = sender.clone();
-            Rc::new(
-                move |phase: PointerPhase, x: f64, y: f64, pressure: f32| {
-                    let _ = sender.send(HostMessage::Pointer {
-                        x,
-                        y,
-                        pressure,
-                        phase,
-                    });
-                },
-            )
+            Rc::new(move |phase: PointerPhase, x: f64, y: f64| {
+                let _ = sender.send(HostMessage::Pointer { x, y, phase });
+            })
         };
 
         let page_px = self.page_pixels();
@@ -470,12 +498,12 @@ impl Component for Shell {
 impl Shell {
     // ── the debug trace ────────────────────────────────────────────────────
     //
-    // A log is only useful if it answers a question.  This one is shaped by the
-    // two symptoms a drawing app can have: "the line broke into dashes" and "it
-    // stutters".  So it records (a) the *runs* of the pen stream — the input
-    // side, which the app cannot fix — and (b) every commit, bake and view, so
-    // the app side can be told apart from it.  One summary line per second keeps
-    // the shape of a long session without a line per sample.
+    // A log is only useful if it answers a question.  With the input split in
+    // two, the questions are: *is the ink where the pen is* (the pointer path)
+    // and *are the attributes still the pen's* (the OTD path) — so every summary
+    // carries the age of the newest report next to the stroke counters.  The
+    // second half of the log is the app's own cost: commits, bakes and views, so
+    // "the pen stutters" can be told apart from "the app stutters".
     //
     // Everything goes through [`Workers::log`]: the UI thread formats a line and
     // hands it over; the log worker owns the file.  No I/O here, ever.
@@ -489,14 +517,15 @@ impl Shell {
         let page = self.document.page().size;
         let (width, height) = self.page_pixels();
         let header = format!(
-            "settings: refresh {:?} · display {} Hz · loop {hz} Hz · tool {:?} · pen {:.1} pt · \
-             margin {:.0} pt\nwindow: client {:.0}x{:.0} dip · page {:.0}x{:.0} pt · scale {:.4} \
-             px/pt · page {:.0}x{:.0} px\ntrace: gap>{} ms · event lines capped at {TRACE_EVENT_CAP}",
+            "settings: refresh {:?} · display {} Hz · loop {hz} Hz · tool {:?} · pen {:.1} pt\n\
+             input:  position from the canvas's pointer event · pressure, tilt and rotation from \
+             OTD's shared memory (good for {ATTRIBUTE_FRESH_MS:.0} ms)\n\
+             window: client {:.0}x{:.0} dip · page {:.0}x{:.0} pt · scale {:.4} px/pt · \
+             page {:.0}x{:.0} px\ntrace:  event lines capped at {TRACE_EVENT_CAP}",
             self.refresh,
             self.detected_hz,
             self.tool,
             self.width_for(self.tool),
-            self.settings.margin_pt,
             self.client.width,
             self.client.height,
             page.width,
@@ -504,7 +533,6 @@ impl Shell {
             self.scale.get(),
             width,
             height,
-            TRACE_GAP_MS,
         );
         self.workers.log(header);
     }
@@ -547,8 +575,8 @@ impl Shell {
              loop: ticks {:.0}/s · updates {:.0}/s · messages {:.0}/s (tablet {:.0}/s · intents {})\n\
              ui:   views {:.0}/s · view {:.2} ms (worst {:.2}) · update {:.2} ms (worst {:.2}) · \
              frame gap {:.1} ms (worst {:.1}) · live shapes {}\n\
-             pen:  samples {:.0}/s · commits {:.0}/s · points/stroke {:.1} · ended by stale {:.0}/s · \
-             tip-up {:.0}/s · out-of-range {:.0}/s · gaps>{}ms {:.0}/s (worst {:.1}) · skipped {}\n\
+             pen:  pointers {:.0}/s ({:.0}/s drawn) · reports {:.0}/s · report age {:.1} ms (worst {:.1}) · \
+             no report {:.0}/s · commits {:.0}/s · points/stroke {:.1} · skipped {}\n\
              bake: asked {:.0}/s · landed {:.0}/s · dropped(stale) {:.0}/s · bake {:.1} ms · \
              decodes {:.0}/s · swaps {:.0}/s",
             rate(stats.ticks),
@@ -568,15 +596,14 @@ impl Shell {
             stats.frame_gap_ms,
             stats.frame_gap_worst_ms,
             stats.live_pieces,
-            rate(stats.samples),
+            rate(stats.pointer_messages),
+            rate(stats.pointers),
+            rate(stats.reports),
+            stats.attribute_age_ms,
+            stats.attribute_age_worst_ms,
+            rate(stats.stale_attributes),
             rate(stats.commits),
             average_points,
-            rate(stats.stale),
-            rate(stats.tip_up),
-            rate(stats.out_of_range),
-            TRACE_GAP_MS,
-            rate(stats.gaps),
-            stats.gap_worst_ms,
             stats.skipped,
             rate(stats.bakes),
             rate(stats.bakes_landed),
@@ -643,12 +670,7 @@ impl Shell {
         match message {
             HostMessage::Wake | HostMessage::Tick => {}
             HostMessage::Tablet(batch) => self.tablet(batch),
-            HostMessage::Pointer {
-                x,
-                y,
-                pressure,
-                phase,
-            } => self.pointer(x, y, pressure, phase),
+            HostMessage::Pointer { x, y, phase } => self.pointer(x, y, phase),
             HostMessage::Baked(baked) => self.baked(baked),
             HostMessage::Decoded(slot) => {
                 let age_ms = self
@@ -755,188 +777,135 @@ impl Shell {
 
     // ── input ──────────────────────────────────────────────────────────────
 
-    /// One delivery from the OTD reader thread.
+    /// One delivery from the OTD reader thread: the pen's **attributes**.
+    ///
+    /// Nothing is drawn here.  A report says how hard the pen is pressed, how it
+    /// is tilted, how the barrel is turned and whether the eraser end is down;
+    /// *where* the ink goes comes from the canvas ([`Shell::pointer`]).  Keeping
+    /// the two apart is what makes the ink land under the nib at any window
+    /// size, zoom or page shape.
     fn tablet(&mut self, batch: Batch) {
         self.stats.batches += 1;
         if let Some(spec) = batch.spec {
-            self.map = PageMap::fit(&spec, self.document.page().size, self.settings.margin_pt);
-            self.tablet = Some(spec.clone());
-            let area = match &self.map {
-                Some(map) => {
-                    let (left, top) = map.origin();
-                    let (right, bottom) = map.far_corner();
-                    format!("ink area x {left:.0}..{right:.0} · y {top:.0}..{bottom:.0} pt")
-                }
-                None => "no ink area (the page has no room for the margin)".to_string(),
-            };
             self.trace_line(format!(
-                "tablet: '{}' range {} x {} pressure {} · {area}",
+                "tablet: '{}' range {} x {} pressure {}",
                 spec.name, spec.max_x, spec.max_y, spec.max_pressure
             ));
+            self.tablet = Some(spec);
         }
         self.source = batch.source.clone();
-        // A reason is a fact worth showing: "no range" is what stops the pen.
+        // A reason is a fact worth showing: a missing range is what stops the
+        // pressure from being normalized.
         if let Some(problem) = &batch.problem {
             self.status = problem.clone();
         }
-        self.samples += batch.samples.len() as u64;
+        self.reports += batch.samples.len() as u64;
         self.skipped += batch.stats.skipped;
-        self.stats.samples += batch.samples.len() as u64;
+        self.stats.reports += batch.samples.len() as u64;
         self.stats.skipped += batch.stats.skipped;
         for sample in &batch.samples {
-            self.observe(sample);
-            self.pen(sample);
+            self.read_attributes(sample);
+        }
+        if !batch.samples.is_empty() {
+            // The reports have just been applied, so this is the moment their age
+            // starts counting from (the pointer samples are the ones that measure
+            // it).
+            self.pen_at = Some(Instant::now());
         }
     }
 
-    /// Watches the raw stream: the **runs** of "the tip is down" and the gaps.
+    /// One report → the pen's live attributes.
     ///
-    /// This is the input half of the diagnosis, and it is deliberately separate
-    /// from [`Shell::pen`]: a short tip-down run *is* a dash on the page, and a
-    /// gap is a jump the pen never drew.  Both are facts about the stream, not
-    /// about the app's decisions — which is exactly what has to be told apart.
-    fn observe(&mut self, sample: &otd::Sample) {
-        let down = sample.touches() && !sample.out_of_range();
-        if self.seen_time != 0 {
-            let dt_ms = sample.time.saturating_sub(self.seen_time) as f32 / 10_000.0;
-            if dt_ms > TRACE_GAP_MS {
-                self.stats.gaps += 1;
-                self.stats.gap_worst_ms = self.stats.gap_worst_ms.max(dt_ms);
-                self.trace_line(format!(
-                    "gap: {dt_ms:.1} ms of stream missing before seq {} (flags 0x{:02x} p {:.0} \
-                     x {:.0} y {:.0}) · the run before it was {} reports long",
-                    sample.seq, sample.flags, sample.pressure, sample.x, sample.y, self.run_len
-                ));
-            }
+    /// The pressure is smoothed **here**, at the report rate, because that is the
+    /// rate the hardware's noise arrives at; every pointer sample then reuses the
+    /// smoothed value instead of filtering it again at a different rate.
+    ///
+    /// The stream's tip flag decides nothing: WinUI's pointer press is what starts
+    /// a stroke (a pen that hovers must not ink).  What the trace looks for is the
+    /// moment the pressure becomes real — that is the moment the pen was pressed,
+    /// and a pen that never gets there is a tablet that stopped reporting it.
+    fn read_attributes(&mut self, sample: &otd::Sample) {
+        let pen = PenState::from_sample(sample, self.tablet.as_ref());
+        if pen.touching && pen.pressure > 0.0 {
+            self.pressure = smooth_pressure(self.pressure, pen.pressure);
         }
-        match self.seen_down {
-            Some(previous) if previous == down => {
-                self.run_len += 1;
-                self.run_pressure.1 = sample.pressure;
-            }
-            Some(previous) => {
-                // A run just ended — this is the moment the app decides whether to
-                // end a stroke, so it gets one line.  The pressure range is the
-                // number that matters: a tip-down run whose pressure decays to ~0
-                // is a tablet that stopped reporting pressure, not a pen that was
-                // lifted (the tip flag is `pressure > 0` in the plugin).
-                self.trace_line(format!(
-                    "run: {} {} reports (p {:.0}..{:.0}, x {:.0}→{:.0} y {:.0}→{:.0}) → {} at seq {} \
-                     (flags 0x{:02x} p {:.0})",
-                    if previous { "tip-down" } else { "tip-up" },
-                    self.run_len,
-                    self.run_pressure.0,
-                    self.run_pressure.1,
-                    self.run_from.0,
-                    sample.x,
-                    self.run_from.1,
-                    sample.y,
-                    if down { "tip-down" } else { "tip-up" },
-                    sample.seq,
-                    sample.flags,
-                    sample.pressure
-                ));
-                self.run_len = 1;
-                self.run_pressure = (sample.pressure, sample.pressure);
-                self.run_from = (sample.x, sample.y);
-            }
-            None => {
-                self.run_len = 1;
-                self.run_pressure = (sample.pressure, sample.pressure);
-                self.run_from = (sample.x, sample.y);
-            }
+        // Three changes are worth a line — all happen per stroke, not per report:
+        // the pen being pressed, a barrel button, and the eraser end.
+        let down = pen.pressure >= TIP_DOWN_TRACE_PRESSURE;
+        let was_down = self.pen.pressure >= TIP_DOWN_TRACE_PRESSURE;
+        if down && !was_down {
+            self.trace_line(format!(
+                "attrs: tip down — p {:.2} · tilt {:.0},{:.0}° · rotation {:.0}°{}",
+                pen.pressure,
+                pen.nib.tilt_x,
+                pen.nib.tilt_y,
+                pen.nib.rotation,
+                if pen.erasing { " · eraser" } else { "" }
+            ));
+        } else if pen.buttons != self.pen.buttons {
+            self.trace_line(format!(
+                "attrs: pen buttons {} at seq {}",
+                pen.buttons, sample.seq
+            ));
+        } else if pen.erasing != self.pen.erasing {
+            self.trace_line(format!(
+                "attrs: {} at seq {}",
+                if pen.erasing { "eraser down" } else { "eraser up" },
+                sample.seq
+            ));
         }
-        self.seen_down = Some(down);
-        self.seen_time = sample.time;
+        self.pen = pen;
     }
 
-    /// One pen report → ink.  This is the hot path: O(1), no allocation after
-    /// the first point of a stroke, no work proportional to the page.
-    fn pen(&mut self, sample: &otd::Sample) {
-        let Some(map) = self.map else {
-            return;
+    /// The attributes a pointer sample is drawn with: pressure, nib, eraser.
+    ///
+    /// The newest report is reused here (there are usually several pointer
+    /// samples per report, and both streams run at their own rate), so it is
+    /// read once per batch and looked up per sample:
+    ///
+    /// * a fresh report carrying pressure → the smoothed pressure;
+    /// * a fresh report with no pressure hardware → speed stands in for it
+    ///   ([`pressure_from_speed`]);
+    /// * anything older than [`ATTRIBUTE_FRESH_MS`], or nothing at all → the
+    ///   mouse fallback, so a plain mouse still writes a visible line.
+    fn attributes(&mut self, at: Pt, ticks: u64) -> PenInput {
+        let age_ms = self
+            .pen_at
+            .map(|at| at.elapsed().as_secs_f32() * 1000.0)
+            .filter(|age| *age <= ATTRIBUTE_FRESH_MS);
+        let Some(age_ms) = age_ms else {
+            return PenInput {
+                pressure: MOUSE_PRESSURE,
+                nib: Nib::UPRIGHT,
+                eraser: false,
+                fresh: false,
+            };
         };
-        let at = map.to_page(sample.x, sample.y);
-        let stale = sample.time.saturating_sub(self.last_sample_time) > STALE_GAP_TICKS;
-
-        // Pressure: what the hardware reports (smoothed), or speed when it
-        // reports none.  A gap in time ends the stroke instead of drawing a line
-        // across the page — the samples in the ring are still valid, they are
-        // just old.
-        let pressure = if sample.touches() && sample.pressure > 0.0 {
-            self.pressure = smooth_pressure(self.pressure, map.pressure(sample.pressure));
+        self.stats.attribute_age_ms = age_ms;
+        self.stats.attribute_age_worst_ms = self.stats.attribute_age_worst_ms.max(age_ms);
+        let pressure = if self.pen.pressure > 0.0 {
             self.pressure
-        } else if sample.touches() {
-            pressure_from_speed(self.speed_pt_per_ms(at, sample.time))
         } else {
-            0.0
+            pressure_from_speed(self.speed_pt_per_ms(at, ticks))
         };
-
-        if stale && self.live.is_some() {
-            self.stats.stale += 1;
-            self.trace_line(format!(
-                "end: stale — {:.1} ms since the last report (seq {} flags 0x{:02x} p {:.3} \
-                 x {:.0} y {:.0})",
-                sample.time.saturating_sub(self.last_sample_time) as f32 / 10_000.0,
-                sample.seq,
-                sample.flags,
-                sample.pressure,
-                sample.x,
-                sample.y
-            ));
-            self.commit_live();
+        PenInput {
+            pressure,
+            nib: self.pen.nib,
+            eraser: self.pen.erasing,
+            fresh: true,
         }
-
-        let erasing = sample.is_eraser() || self.tool.erases();
-        if sample.touches() && !sample.out_of_range() {
-            if erasing {
-                self.erasing = true;
-                self.erase_at(at);
-            } else {
-                self.ink(at, pressure, sample.time);
-            }
-        } else {
-            if self.live.is_some() {
-                // The two flags are worth separating: out-of-range means the pen
-                // left the tablet, a cleared tip means it was lifted (or that a
-                // hover report slipped into the stream).
-                if sample.out_of_range() {
-                    self.stats.out_of_range += 1;
-                    self.trace_line(format!(
-                        "end: out-of-range at seq {} (the pen left the tablet)",
-                        sample.seq
-                    ));
-                } else {
-                    self.stats.tip_up += 1;
-                    self.trace_line(format!(
-                        "end: tip up at seq {} (flags 0x{:02x} p {:.3} x {:.0} y {:.0})",
-                        sample.seq, sample.flags, sample.pressure, sample.x, sample.y
-                    ));
-                }
-            }
-            self.commit_live();
-        }
-
-        self.last_pos = at;
-        self.last_sample_time = sample.time;
     }
 
     /// Adds a point to the stroke under the pen, starting one if needed.
-    fn ink(&mut self, at: Pt, pressure: f32, ticks: u64) {
+    fn ink(&mut self, at: Pt, pressure: f32, nib: Nib, ticks: u64) {
+        if self.live.is_none() {
+            // A new stroke starts here, so this tick is its time zero.
+            self.stroke_start = ticks;
+            self.live = Some(Stroke::new(Style::new(self.tool, self.width_for(self.tool))));
+        }
         let time_ms = ticks.saturating_sub(self.stroke_start) as f64 / 10_000.0;
-        let point = InkPoint {
-            pos: at,
-            pressure,
-            time_ms,
-        };
-        match &mut self.live {
-            Some(stroke) => stroke.push(point),
-            None => {
-                let mut stroke = Stroke::new(Style::new(self.tool, self.width_for(self.tool)));
-                stroke.push(point);
-                self.live = Some(stroke);
-                self.stroke_start = ticks;
-            }
+        if let Some(stroke) = &mut self.live {
+            stroke.push(InkPoint::with_nib(at, pressure, nib, time_ms));
         }
     }
 
@@ -970,46 +939,64 @@ impl Shell {
         }
     }
 
-    /// Speed of the pen in pt/ms (used when the tablet reports no pressure).
+    /// Speed of the pointer in pt/ms (used when the tablet reports no pressure).
     fn speed_pt_per_ms(&self, at: Pt, ticks: u64) -> f32 {
-        let elapsed_ms = ticks.saturating_sub(self.last_sample_time) as f32 / 10_000.0;
+        let elapsed_ms = ticks.saturating_sub(self.last_pointer_ticks) as f32 / 10_000.0;
         if elapsed_ms <= 0.0 {
             return 0.0;
         }
         self.last_pos.distance_to(at) / elapsed_ms
     }
 
-    /// The fallback path: a WinUI pointer (a mouse, or a pen without OTD).
+    /// One pointer sample → ink (or an erase) **where the pointer is**.
     ///
-    /// The coordinates are page DIPs (the handler sits on a control the size of
-    /// the page), so `scale.pt(..)` turns them into page points — no scroll offset
-    /// and no toolbar height to subtract.  A pointer event carries no device clock,
-    /// so the samples are stamped from `pointer_base` instead.
-    fn pointer(&mut self, x: f64, y: f64, pressure: f32, phase: PointerPhase) {
-        // A digitizer that runs through OTD already writes ink, and WinUI reports
-        // the same pen as a pointer: taking both would draw two strokes.
-        if matches!(self.source, Source::Live { .. }) {
-            return;
-        }
+    /// The coordinates come from the canvas's pointer event, in page DIPs (the
+    /// handler sits on a control the size of the page), so `scale.pt(..)` turns
+    /// them into page points — no scroll offset and no toolbar height to
+    /// subtract, and no tablet mapping in between.  A pointer event carries no
+    /// device clock, so the samples are stamped from `pointer_base` instead.
+    fn pointer(&mut self, x: f64, y: f64, phase: PointerPhase) {
+        // Counted for *every* phase, drawn or not: this number next to the
+        // drawn one is how the log answers "does WinUI see this pen at all?".
+        self.stats.pointer_messages += 1;
+        self.pointer_messages += 1;
         let at = Pt::new(self.scale.pt(x as f32), self.scale.pt(y as f32));
         // QPC-style ticks (100 ns), the unit the ink model stores.
         let ticks = Instant::now()
             .saturating_duration_since(self.pointer_base)
             .as_nanos() as u64
             / 100;
-        match phase {
+        let input = self.attributes(at, ticks);
+        // The pen's eraser end erases, and so does the eraser tool — and both
+        // keep erasing until the pen is lifted, even if the report changes.
+        let erasing = input.eraser || self.tool.erases();
+        // The *press* is what starts a stroke.  A pen hovering over the canvas
+        // also reports moves, and a hover must not leave ink behind.
+        let contact = match phase {
             PointerPhase::Pressed => {
-                self.pressure = pressure;
-                self.ink(at, pressure, ticks);
+                self.erasing = erasing;
+                true
             }
-            PointerPhase::Moved => {
-                if self.live.is_some() {
-                    self.ink(at, pressure, ticks);
-                }
+            PointerPhase::Moved => self.erasing || self.live.is_some(),
+            PointerPhase::Released => false,
+        };
+        if contact {
+            self.stats.pointers += 1;
+            self.pointers += 1;
+            if !input.fresh {
+                self.stats.stale_attributes += 1;
             }
-            PointerPhase::Released => self.commit_live(),
+            if erasing {
+                self.erase_at(at);
+            } else {
+                self.ink(at, input.pressure, input.nib, ticks);
+            }
+        }
+        if phase == PointerPhase::Released {
+            self.commit_live();
         }
         self.last_pos = at;
+        self.last_pointer_ticks = ticks;
     }
 
     // ── screen / document ──────────────────────────────────────────────────
@@ -1425,16 +1412,27 @@ impl Shell {
     fn dev_report(&self) -> String {
         let hz = self.refresh.resolve(self.detected_hz);
         let page = self.document.page();
-        // Where the pen can reach: the tablet is fitted into the page keeping its
-        // aspect ratio, so this is the one line that explains why the ink lands
-        // where it does.
-        let ink_area = match &self.map {
-            Some(map) => {
-                let (left, top) = map.origin();
-                let (right, bottom) = map.far_corner();
-                format!("x {left:.0}..{right:.0} · y {top:.0}..{bottom:.0} pt")
-            }
-            None => "none yet".to_string(),
+        // The attributes the ink is currently drawn with, and how old the report
+        // they came from is.  The *position* is deliberately not in this list: it
+        // comes from the canvas's pointer event, which is what keeps the ink
+        // under the nib.
+        let buttons = if self.pen.buttons == 0 {
+            String::new()
+        } else {
+            format!(" · buttons {}", self.pen.buttons)
+        };
+        let attributes = match self.pen_at {
+            Some(at) => format!(
+                "p {:.2} · tilt {:.0},{:.0}° · rotation {:.0}° · report {:.1} ms old{}{}",
+                self.pressure,
+                self.pen.nib.tilt_x,
+                self.pen.nib.tilt_y,
+                self.pen.nib.rotation,
+                at.elapsed().as_secs_f32() * 1000.0,
+                if self.pen.erasing { " · eraser down" } else { "" },
+                buttons
+            ),
+            None => "none yet — the mouse fallback (half pressure, no tilt)".to_string(),
         };
         // The render cadence, measured in `view`, next to the rate the ticker
         // was asked for: when those two disagree, the loop is paced but the UI
@@ -1454,10 +1452,11 @@ impl Shell {
             "loop {} Hz · display {} Hz · frames {}\n\
              ui busy {:.2} ms (worst {:.2} ms) · bake {:.1} ms · pdf render {:.1} ms\n\
              views {} · view {:.2} ms (worst {:.2}) · last frame gap {:.1} ms · live shapes {}\n\
-             pen samples {} · skipped by the ring {}\n\
+             input: position from the canvas pointer event · {} pointer messages ({} drew) · {} \
+             reports · skipped by the ring {}\n\
+             pen:   {}\n\
              tablet: {}\n\
-             ink area {} (tablet fitted into the page, aspect kept)\n\
-             page {:.0}×{:.0} pt · scale {:.2} px/pt · margin {:.0} pt\n\
+             page {:.0}×{:.0} pt · scale {:.2} px/pt\n\
              strokes on this page {} · undo {} · redo {}\n\
              trace {} · {}\n\
              pdf: {}",
@@ -1473,14 +1472,15 @@ impl Shell {
             self.view_worst_ns.get() as f32 / 1_000_000.0,
             frame_gap_ms,
             self.live_pieces.get(),
-            self.samples,
+            self.pointer_messages,
+            self.pointers,
+            self.reports,
             self.skipped,
+            attributes,
             self.source.summary(),
-            ink_area,
             page.size.width,
             page.size.height,
             self.scale.get(),
-            self.settings.margin_pt,
             page.strokes.len(),
             self.document.can_undo(),
             self.document.can_redo(),

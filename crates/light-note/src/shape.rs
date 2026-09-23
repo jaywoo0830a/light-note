@@ -19,7 +19,7 @@ use vello_cpu::peniko::color::Srgb;
 use vello_cpu::{Pixmap, RenderContext, Resources};
 
 use crate::geom::{Scale, Size};
-use crate::ink::{InkPoint, Rgba, Stroke, width_at};
+use crate::ink::{InkPoint, Rgba, Stroke, heading, width_at};
 
 /// Tolerance (px) for flattening a curve into line segments.  Both consumers use
 /// this value, so a curve cannot be smoother in one of them.
@@ -107,6 +107,10 @@ impl StrokeShape {
 /// stroke whose points were all dropped) has no shape, and saying so in the type
 /// means every consumer has to decide what to do about it instead of drawing an
 /// invisible shape.
+///
+/// Each segment's width is computed **for its own heading**: with the pen held
+/// upright that is just the pressure pair, and with a tilted nib it is the
+/// chisel effect — thick across the nib's edge, thin along it.
 pub fn stroke_shape(stroke: &Stroke, scale: Scale) -> Option<StrokeShape> {
     let points = stroke.points();
     let factor = scale.get() as f64;
@@ -115,22 +119,49 @@ pub fn stroke_shape(stroke: &Stroke, scale: Scale) -> Option<StrokeShape> {
     }
     if points.len() == 1 {
         let point = points[0];
-        let radius = (width_at(stroke.style(), point.pressure) * factor * 0.5).max(0.35);
+        let radius = (width_at(stroke.style(), point.pressure, point.nib, None) * factor * 0.5)
+            .max(0.35);
         return Some(StrokeShape::Dot {
             center: (point.pos.x as f64 * factor, point.pos.y as f64 * factor),
             radius,
         });
     }
 
-    let widths: Vec<f64> = points
+    // Two width sets, because they answer two different questions:
+    //
+    // * per **point**, with the widest footprint — is this stroke uniform enough
+    //   to be one smooth curve, or does it taper?
+    // * per **segment**, at that segment's own heading — how wide is this piece
+    //   on the page?  With a tilted nib the two differ, and that difference *is*
+    //   the chisel edge.
+    let style = stroke.style();
+    let point_widths: Vec<f64> = points
         .iter()
-        .map(|point| width_at(stroke.style(), point.pressure) * factor)
+        .map(|point| width_at(style, point.pressure, point.nib, None) * factor)
         .collect();
-    let max = widths.iter().copied().fold(0.0_f64, f64::max);
-    let min = widths.iter().copied().fold(f64::MAX, f64::min);
+    let segment_widths: Vec<f64> = points
+        .windows(2)
+        .map(|pair| {
+            let direction = heading(pair[0].pos, pair[1].pos);
+            let near = width_at(style, pair[0].pressure, pair[0].nib, direction);
+            let far = width_at(style, pair[1].pressure, pair[1].nib, direction);
+            (near + far) * 0.5 * factor
+        })
+        .collect();
+    let max = point_widths
+        .iter()
+        .chain(segment_widths.iter())
+        .copied()
+        .fold(0.0_f64, f64::max);
+    let min = point_widths
+        .iter()
+        .chain(segment_widths.iter())
+        .copied()
+        .fold(f64::MAX, f64::min);
 
-    // A highlighter is constant by construction; a pen whose pressure barely
-    // moved is treated as constant too (one smooth curve instead of many spans).
+    // A highlighter is constant by construction; a pen whose pressure *and* nib
+    // angle barely moved is treated as constant too — one smooth curve instead of
+    // many spans.
     if (max - min) <= max * 0.05 {
         return Some(StrokeShape::Curve {
             width: max,
@@ -143,7 +174,7 @@ pub fn stroke_shape(stroke: &Stroke, scale: Scale) -> Option<StrokeShape> {
             .windows(2)
             .enumerate()
             .map(|(index, pair)| Span {
-                width: (widths[index] + widths[index + 1]) * 0.5,
+                width: segment_widths[index],
                 from: (pair[0].pos.x as f64 * factor, pair[0].pos.y as f64 * factor),
                 to: (pair[1].pos.x as f64 * factor, pair[1].pos.y as f64 * factor),
             })

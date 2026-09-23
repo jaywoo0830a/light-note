@@ -18,7 +18,6 @@ fn the_defaults_are_what_a_first_run_should_be() {
     assert_eq!(settings.pen_width_pt, 2.0);
     assert_eq!(settings.highlighter_width_pt, 14.0);
     assert_eq!(settings.eraser_radius_pt, 12.0);
-    assert_eq!(settings.margin_pt, 24.0);
     assert!(settings.show_dev_panel == false);
 }
 
@@ -28,7 +27,6 @@ fn settings_round_trip_through_json() {
     settings.refresh = RefreshChoice::Fixed(240);
     settings.tool = Tool::Highlighter;
     settings.pen_width_pt = 3.5;
-    settings.margin_pt = 36.0;
 
     let json = settings.to_json().expect("serialize");
     let restored = Settings::from_json(&json).expect("deserialize");
@@ -45,7 +43,6 @@ fn a_setting_from_a_newer_version_is_ignored_not_rejected() {
         "pen_width_pt": 2.0,
         "highlighter_width_pt": 14.0,
         "eraser_radius_pt": 12.0,
-        "margin_pt": 24.0,
         "show_dev_panel": false,
         "something_from_the_future": {"nested": [1, 2, 3]}
     }"#;

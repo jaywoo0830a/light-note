@@ -21,7 +21,7 @@
 
 use serde::Deserialize;
 
-use super::map::TabletSpec;
+use super::spec::TabletSpec;
 
 /// The id the app's one request uses, so its answer is recognisable.
 pub const ID: u32 = 1;

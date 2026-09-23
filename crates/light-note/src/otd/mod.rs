@@ -1,5 +1,5 @@
-//! OpenTabletDriver input: the shared-memory protocol, the tablet mapping and
-//! the thread that polls them.
+//! OpenTabletDriver input: the shared-memory protocol and the thread that polls
+//! it.
 //!
 //! ```text
 //! OTD daemon ──► plugin (C#) ──► shared memory ──► reader thread ──► Inbox ──► UI
@@ -10,14 +10,25 @@
 //! have to: by the time a batch reaches `Component::update`, everything in it is
 //! already decoded.  A batch is `Send` and small — a handful of samples plus the
 //! tablet's range, which the plugin only knows after it has seen the device.
+//!
+//! # What the stream is used for
+//!
+//! **Attributes, not position.**  The pen's pressure, tilt, barrel rotation and
+//! eraser flag are all here (`PROTOCOL.md`), and none of them exist in WinUI's
+//! pointer event — so they come from OTD.  The *position*, on the other hand,
+//! comes from the canvas's own pointer event: that is the point on the screen
+//! the pen is actually touching, so the ink cannot drift away from the cursor
+//! when the window is resized, the page is zoomed or the tablet's active area
+//! does not match the page's aspect ratio.  The tablet's coordinates are still
+//! decoded (they are part of the contract) but nothing draws from them.
 
-pub mod map;
 pub mod reader;
 pub mod rpc;
 pub mod shm;
+pub mod spec;
 pub mod tablets;
 
-pub use map::{PageMap, TabletSpec};
+pub use spec::{PenState, TabletSpec};
 pub use shm::{
     CAPACITY, HEADER_LEN, Header, MAP_NAME, MAGIC, ReadStats, RingReader, SAMPLE_LEN, Sample,
     ShmError, TOTAL_LEN, VERSION, decode_header, decode_sample, fill_tablet,
@@ -28,6 +39,15 @@ pub use shm::{
 /// A 400 Hz tablet produces a sample every 2.5 ms, so 1 ms keeps the extra
 /// latency under one sample and costs one atomic load per poll.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How old the newest report may be and still describe the pen a pointer sample
+/// is drawn with.
+///
+/// This is the budget for everything between the plugin writing a report and the
+/// app drawing with it (the reader's 1 ms poll, the inbox hop, one frame).  Past
+/// it the attributes are stale — the plugin stopped, the cable came out — and
+/// the app draws with its fallback instead of a frozen pressure.
+pub const ATTRIBUTE_FRESH_MS: f32 = 50.0;
 
 /// Where the input is coming from — what the status bar shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,10 +100,3 @@ impl Batch {
         self.samples.is_empty() && self.spec.is_none()
     }
 }
-
-/// How long a gap between two samples means "this is a new stroke".
-///
-/// After a stall the ring still holds old samples; drawing them as one stroke
-/// would put a long straight line across the page.  The app compares timestamps
-/// (100 ns QPC ticks) and starts a new stroke instead.
-pub const STALE_GAP_TICKS: u64 = 50 * 10_000; // 50 ms

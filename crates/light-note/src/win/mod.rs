@@ -16,6 +16,11 @@
 //! │ frame ticker (60/120/180/240 Hz) · file dialogs (STA)                  │
 //! └────────────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! The input arrives in two halves and they meet in the shell: the canvas's own
+//! pointer event says *where* the pen is, and the OTD reader says *how* it is
+//! pressed and held (pressure, tilt, the barrel's rotation).  `shell` explains
+//! why that split is what keeps the ink under the nib.
 
 pub mod screen;
 pub mod shell;
@@ -81,12 +86,16 @@ pub enum HostMessage {
     Tick,
     /// "The inbox has something" — the UI drains it (never blocks).
     Wake,
-    /// Pen reports from the OTD reader thread.
+    /// Pen **attributes** from the OTD reader thread: pressure, tilt, the
+    /// barrel's rotation and the eraser flag.  The position is not in here — that
+    /// is the canvas's own pointer event ([`HostMessage::Pointer`]).
     Tablet(Batch),
     /// What the elm screen asked for (it never touches the document itself).
     Intent(Intent),
-    /// A pointer sample from WinUI (a mouse or a pen without OTD).
-    Pointer { x: f64, y: f64, pressure: f32, phase: PointerPhase },
+    /// A pointer sample from the canvas: the position the pen (or the mouse) is
+    /// touching, in *page* DIPs.  The pressure and the tilt do not travel with
+    /// it — they come from OTD's shared memory ([`crate::otd::PenState`]).
+    Pointer { x: f64, y: f64, phase: PointerPhase },
     /// A page bitmap finished baking (the tail can be trimmed).
     Baked(workers::Baked),
     /// WinUI finished decoding a buffered bitmap — it may now be shown.
@@ -107,7 +116,7 @@ pub enum HostMessage {
     Resized(f64, f64),
 }
 
-/// Pointer phases from WinUI (the fallback path when OTD is not running).
+/// Pointer phases from WinUI: the canvas's own report of where the pen is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerPhase {
     Pressed,

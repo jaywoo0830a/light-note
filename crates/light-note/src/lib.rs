@@ -2,7 +2,9 @@
 //!
 //! Write on a PDF with a pen: the tablet talks to
 //! [OpenTabletDriver](https://opentabletdriver.net/), a small OTD plugin
-//! (`OTD.SharedMemoryOutput/`) publishes the pen reports through shared memory,
+//! (`OTD.SharedMemoryOutput/`) publishes the pen's **pressure, tilt, rotation and
+//! eraser flag** through shared memory, the canvas's own pointer event says
+//! *where* the pen is (so the ink lands under the nib),
 //! [Pdfium](https://pdfium.googlesource.com/pdfium/) renders the page (through
 //! `pdfium-render`), and [elm-magic](https://crates.io/crates/elm-magic) turns
 //! state into WinUI 3 controls (through `elm-magic-windows-reactor`).
@@ -13,7 +15,7 @@
 //! `Component::update` and `view`) only ever:
 //!
 //! 1. **applies a message** to plain values ([`doc::Document`], [`ink`],
-//!    [`canvas`] state) — O(1) per pen sample;
+//!    `win::surface` state) — O(1) per pen sample;
 //! 2. **builds a view** from those values — bounded by [`shape::LIVE_BUDGET`]
 //!    live shapes, never by the number of strokes on the page;
 //! 3. **posts work** to a worker and moves on.
@@ -24,7 +26,7 @@
 //!
 //! | work | thread | comes back as |
 //! |---|---|---|
-//! | pen reports (shared memory) | OTD reader thread | a batch of samples |
+//! | pen attributes (shared memory) | OTD reader thread | a batch of reports |
 //! | page raster + ink bake + PNG | bake worker (latest-wins) | a ready bitmap |
 //! | Pdfium open/render/save | PDF worker | page sizes, a page bitmap, saved bytes |
 //! | file dialogs | dialog worker | a chosen path |

@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use light_note::geom::{Pt, Size};
-use light_note::ink::{InkPoint, Stroke, Style, Tool};
+use light_note::ink::{InkPoint, Nib, Stroke, Style, Tool};
 use light_note::otd::{CAPACITY, HEADER_LEN, MAGIC, SAMPLE_LEN, VERSION};
 
 /// A4 in points — the default page of a blank note.
@@ -30,11 +30,30 @@ pub fn highlighter(width_pt: f32) -> Style {
 pub fn stroke(style: Style, points: &[(f32, f32, f32)]) -> Stroke {
     let mut stroke = Stroke::new(style);
     for (index, (x, y, pressure)) in points.iter().enumerate() {
-        stroke.push(InkPoint {
-            pos: Pt::new(*x, *y),
-            pressure: *pressure,
-            time_ms: index as f64 * 2.5,
-        });
+        stroke.push(InkPoint::new(
+            Pt::new(*x, *y),
+            *pressure,
+            index as f64 * 2.5,
+        ));
+    }
+    stroke
+}
+
+/// The same, with a tilted and rotated pen: the three angles every point of the
+/// stroke carries.
+pub fn stroke_with_nib(
+    style: Style,
+    nib: Nib,
+    points: &[(f32, f32, f32)],
+) -> Stroke {
+    let mut stroke = Stroke::new(style);
+    for (index, (x, y, pressure)) in points.iter().enumerate() {
+        stroke.push(InkPoint::with_nib(
+            Pt::new(*x, *y),
+            *pressure,
+            nib,
+            index as f64 * 2.5,
+        ));
     }
     stroke
 }

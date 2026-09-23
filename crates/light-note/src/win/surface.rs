@@ -39,7 +39,7 @@ pub struct Buffer {
 
 /// What a mouse reports as pressure: half, which is what Windows uses for a
 /// device without a pressure sensor.
-const MOUSE_PRESSURE: f32 = 0.5;
+pub const MOUSE_PRESSURE: f32 = 0.5;
 
 /// Builds the surface for the current page.
 ///
@@ -47,7 +47,7 @@ const MOUSE_PRESSURE: f32 = 0.5;
 /// looking at.  `live` is the stroke under the pen (or `None`).  `on_decoded`
 /// is called (with the buffer index) when WinUI has finished decoding a buffer,
 /// which is the only moment it is safe to show it.  `on_pointer` receives the
-/// fallback input (a mouse, or a pen without OTD) in page DIPs.
+/// pointer the canvas saw, in page DIPs — the position the ink is drawn at.
 ///
 /// Returns the view and the number of live shapes in it: the count is what the
 /// UI thread pays per frame, so the diagnostics report it instead of guessing.
@@ -58,7 +58,7 @@ pub fn build(
     live: Option<&Stroke>,
     scale: Scale,
     on_decoded: std::rc::Rc<dyn Fn(usize)>,
-    on_pointer: std::rc::Rc<dyn Fn(PointerPhase, f64, f64, f32)>,
+    on_pointer: std::rc::Rc<dyn Fn(PointerPhase, f64, f64)>,
 ) -> (View, usize) {
     let (width, height) = page_px;
 
@@ -111,9 +111,10 @@ pub fn build(
     let event = |phase: PointerPhase| {
         let on_pointer = std::rc::Rc::clone(&on_pointer);
         move |info: PointerEventInfo| {
-            // A mouse reports 0.5; a pen that reaches us through WinUI reports its
-            // own pressure.
-            on_pointer(phase, info.x, info.y, MOUSE_PRESSURE)
+            // The coordinates are relative to *this* control, which is exactly
+            // the page: the ink lands under the pointer at any zoom, and nothing
+            // has to know where the sheet sits inside the window.
+            on_pointer(phase, info.x, info.y)
         }
     };
 
