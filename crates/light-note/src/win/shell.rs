@@ -370,6 +370,10 @@ impl Shell {
             self.tablet = Some(spec);
         }
         self.source = batch.source.clone();
+        // A reason is a fact worth showing: "no range" is what stops the pen.
+        if let Some(problem) = &batch.problem {
+            self.status = problem.clone();
+        }
         self.samples += batch.samples.len() as u64;
         self.skipped += batch.stats.skipped;
         for sample in &batch.samples {

@@ -13,12 +13,14 @@
 
 pub mod map;
 pub mod reader;
+pub mod rpc;
 pub mod shm;
+pub mod tablets;
 
 pub use map::{PageMap, TabletSpec};
 pub use shm::{
     CAPACITY, HEADER_LEN, Header, MAP_NAME, MAGIC, ReadStats, RingReader, SAMPLE_LEN, Sample,
-    ShmError, TOTAL_LEN, VERSION, decode_header, decode_sample,
+    ShmError, TOTAL_LEN, VERSION, decode_header, decode_sample, fill_tablet,
 };
 
 /// How often the reader thread looks at `write_seq`.
@@ -43,7 +45,9 @@ impl Source {
     pub fn summary(&self) -> String {
         match self {
             Self::NoPlugin(reason) => format!("no tablet ({reason})"),
-            Self::NoTablet => "tablet: waiting for the plugin".to_string(),
+            Self::NoTablet => {
+                "tablet: the plugin is running, but OTD reports no tablet range".to_string()
+            }
             Self::Live {
                 tablet,
                 samples_per_second,
@@ -65,6 +69,9 @@ pub struct Batch {
     pub stats: ReadStats,
     /// The plugin's heartbeat (`Stopwatch` ticks) — proves the plugin is alive.
     pub heartbeat: u64,
+    /// Why the input is not usable yet (the range is missing), if that is the
+    /// case.  A fact the status bar can show instead of "waiting".
+    pub problem: Option<String>,
 }
 
 impl Batch {

@@ -17,8 +17,11 @@
 //! This module is pure: bytes in, values out.  The mapping and the thread that
 //! polls it are Windows-only and live in [`super::reader`].
 
+use super::map::TabletSpec;
+
 /// The mapping name the plugin creates (in the session namespace).
 pub const MAP_NAME: &str = "light-note.otd.shm";
+
 /// `"LNOTDSM1"` — distinguishes this mapping from any other.
 pub const MAGIC: u64 = 0x4C4E_4F54_4453_4D31;
 /// The protocol version this reader understands.
@@ -167,6 +170,42 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, ShmError> {
         heartbeat: read_u64(bytes, OFF_HEARTBEAT),
         tablet_name: read_name(bytes),
     })
+}
+
+/// Writes the tablet's range and name into a header.
+///
+/// The plugin **cannot** know them: a `PreTransform` filter never sees
+/// `IOutputMode.Tablet`, so it leaves `max_*` at zero and the app fills them in
+/// from the daemon's `GetTablets` (`PROTOCOL.md`).  Without a range a sample is
+/// just a pair of device units — which is what "the tablet is not detected" means
+/// from the outside.
+///
+/// Only the fields the plugin does not own are touched: its magic, version, sizes,
+/// cursor, heartbeat and samples are left exactly as they are, because a reader
+/// that saw a rewritten `magic` or `write_seq` would drop the whole stream.
+///
+/// Returns `false` when `bytes` is too short to hold a header (nothing is written).
+pub fn fill_tablet(bytes: &mut [u8], spec: &TabletSpec) -> bool {
+    if bytes.len() < HEADER_LEN {
+        return false;
+    }
+    write_f32(bytes, 0x28, spec.max_x);
+    write_f32(bytes, 0x2C, spec.max_y);
+    write_f32(bytes, 0x30, spec.max_pressure);
+    bytes[OFF_TABLET_NAME..OFF_TABLET_NAME + 64].fill(0);
+    // The name is NUL-terminated UTF-8 in a 64-byte field: truncation must not
+    // split a character, or a reader would see a replacement glyph.
+    let name = spec.name.as_bytes();
+    let mut len = name.len().min(63);
+    while len > 0 && !spec.name.is_char_boundary(len) {
+        len -= 1;
+    }
+    bytes[OFF_TABLET_NAME..OFF_TABLET_NAME + len].copy_from_slice(&name[..len]);
+    true
+}
+
+fn write_f32(bytes: &mut [u8], offset: usize, value: f32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 /// Reads sample `seq`, or `None` when its slot does not currently hold it.
