@@ -18,13 +18,16 @@
 //! the ink looks.
 
 use windows_reactor::{
-    Brush, Canvas, CanvasChildExt, ChildrenControl, Color, Ellipse, EncodedImage, Image, KeyedView,
-    LayoutControl, Line, View, VerticalAlignment,
+    Border, Brush, Canvas, CanvasChildExt, ChildrenControl, Color, ContentControl, Ellipse,
+    EncodedImage, HorizontalAlignment, Image, KeyedView, LayoutControl, Line, PointerEventInfo, View,
+    VerticalAlignment,
 };
 
 use crate::geom::Scale;
 use crate::ink::{Rgba, Stroke};
 use crate::shape::{LivePiece, live_pieces, stroke_shape};
+
+use super::PointerPhase;
 
 /// One buffered bitmap: PNG bytes plus whether it may be shown.
 #[derive(Clone, Debug, Default)]
@@ -34,12 +37,17 @@ pub struct Buffer {
     pub decoded: bool,
 }
 
+/// What a mouse reports as pressure: half, which is what Windows uses for a
+/// device without a pressure sensor.
+const MOUSE_PRESSURE: f32 = 0.5;
+
 /// Builds the surface for the current page.
 ///
 /// `buffers` is the double buffer; `active` is the index the user should be
 /// looking at.  `live` is the stroke under the pen (or `None`).  `on_decoded`
 /// is called (with the buffer index) when WinUI has finished decoding a buffer,
-/// which is the only moment it is safe to show it.
+/// which is the only moment it is safe to show it.  `on_pointer` receives the
+/// fallback input (a mouse, or a pen without OTD) in page DIPs.
 pub fn build(
     page_px: (f64, f64),
     buffers: &[Buffer; 2],
@@ -47,6 +55,7 @@ pub fn build(
     live: Option<&Stroke>,
     scale: Scale,
     on_decoded: std::rc::Rc<dyn Fn(usize)>,
+    on_pointer: std::rc::Rc<dyn Fn(PointerPhase, f64, f64, f32)>,
 ) -> View {
     let (width, height) = page_px;
 
@@ -86,10 +95,34 @@ pub fn build(
         children.push(KeyedView::new(index + 2, shape));
     }
 
-    Canvas::new()
+    let canvas = Canvas::new()
         .width(width)
         .height(height)
-        .keyed_children(children)
+        .keyed_children(children);
+
+    // The pointer events live on a `Border` (the only control that carries them in
+    // windows-reactor), sized exactly like the page — so `info.x`/`info.y` are
+    // *page* coordinates in DIPs, not window coordinates, and the mouse lands where
+    // it points at any zoom.
+    let event = |phase: PointerPhase| {
+        let on_pointer = std::rc::Rc::clone(&on_pointer);
+        move |info: PointerEventInfo| {
+            // A mouse reports 0.5; a pen that reaches us through WinUI reports its
+            // own pressure.
+            on_pointer(phase, info.x, info.y, MOUSE_PRESSURE)
+        }
+    };
+
+    Border::new()
+        .width(width)
+        .height(height)
+        // The sheet is centered on the desk (the desk is bigger than the page).
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .on_pointer_pressed(event(PointerPhase::Pressed))
+        .on_pointer_moved(event(PointerPhase::Moved))
+        .on_pointer_released(event(PointerPhase::Released))
+        .content(canvas)
         .into()
 }
 
